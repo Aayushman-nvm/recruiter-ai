@@ -1,1 +1,8 @@
-\[PUB] India_runs_data_and_ai_challenge
+\[PUB] India_runs_data_and_ai_challenge/
+data/
+__pycache__/
+.env
+eval/manual_labels.json
+*.pyc
+.DS_Store
+tmp_jd.txt
