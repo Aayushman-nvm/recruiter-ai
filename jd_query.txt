@@ -1,0 +1,9 @@
+Senior AI Engineer for production ranking, retrieval, and recommendation systems at Redrob AI (Series A, India-based AI talent intelligence platform).
+
+Required: production embedding-based retrieval systems (sentence-transformers, BGE, E5, OpenAI embeddings), vector databases and hybrid search (Pinecone, Weaviate, Qdrant, Milvus, FAISS, Elasticsearch, OpenSearch), BM25 hybrid retrieval, learning-to-rank, evaluation frameworks for ranking systems (NDCG, MRR, MAP, offline-to-online correlation), strong Python, NLP, information retrieval.
+
+Nice to have: LLM fine-tuning (LoRA, QLoRA, PEFT), XGBoost-based or neural learning-to-rank, HR-tech or recruiting-tech background, distributed systems, open-source AI/ML contributions.
+
+Context: 5-9 years of experience; 4-5 years specifically in applied ML at product companies (not pure services). India-based strongly preferred: Noida, Pune, Delhi NCR, Hyderabad, Mumbai, Bengaluru, Gurgaon. Notice period under 30 days preferred; up to 30-day buyout possible. Mentoring mindset, scrappy product-engineering attitude, systems thinker.
+
+Not suitable: IT-services-only career (TCS, Infosys, Wipro, Accenture, Cognizant, Capgemini, etc.), title-chasers who switch companies every 1.5 years, LangChain-only API experience under 12 months, research-only roles without production deployment, computer vision or speech primary focus without meaningful NLP or information retrieval experience.
