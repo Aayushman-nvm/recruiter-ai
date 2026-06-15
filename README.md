@@ -1,0 +1,171 @@
+# Redrob Candidate Ranker
+
+A multi-stage AI candidate ranking pipeline for the Redrob Intelligent Candidate Discovery & Ranking Challenge.
+
+**Input:** 100,000 candidate profiles (JSONL) + job description  
+**Output:** `submission.csv` — top 100 candidates, ranked, with scores and reasoning  
+**Constraints:** ≤5 min wall-clock, ≤16 GB RAM, CPU-only, no network during `rank.py`
+
+---
+
+## Architecture
+
+```
+PRE-COMPUTATION (no time limit — run once)
+──────────────────────────────────────────
+candidates.jsonl.gz
+    ├── Script 01 ──► features.parquet (structured signals)
+    ├── Script 02 ──► candidate_embeddings.npy + candidate_ids.txt + candidate_texts.pkl
+    ├── Script 03 ──► jd_embedding.npy (from jd_query.txt)
+    └── Script 04 ──► reasoning_cache.json (via Ollama phi3:mini)
+
+RANKING STEP (≤5 min, CPU, no network)
+───────────────────────────────────────
+Stage 1: BM25 keyword retrieval on candidate_texts
+Stage 2: Dense cosine similarity (bge-base embeddings)
+Fusion:  RRF(BM25_rank, dense_rank) → shortlist top-2000
+Stage 3: Structural + availability scoring on top-2000
+Stage 4: Cross-encoder reranker on top-500 → final top-100
+Output:  submission.csv (candidate_id, rank, score, reasoning)
+```
+
+---
+
+## Setup
+
+```bash
+# 1. Install Python dependencies
+pip install -r requirements.txt
+
+# 2. Pre-download models (do this ONCE during setup — avoids network calls at rank time)
+python -c "
+from sentence_transformers import SentenceTransformer, CrossEncoder
+SentenceTransformer('BAAI/bge-base-en-v1.5')
+CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+print('Models cached.')
+"
+
+# 3. Install Ollama (for reasoning generation only — not needed for rank.py)
+# Windows: download from https://ollama.ai/download
+ollama pull phi3:mini
+```
+
+---
+
+## Execution Order
+
+```bash
+# Pre-computation (run once — can take several hours for 100K candidates)
+python scripts/01_extract_features.py
+python scripts/02_embed_candidates.py    # ~3-4 hours on Ryzen 3 — run overnight
+python scripts/03_embed_jd.py
+
+# First-pass ranking (identifies top-100 IDs for reasoning)
+python rank.py --no-reasoning
+
+# Generate reasoning for exact top-100
+python scripts/04_generate_reasoning.py
+
+# Final ranking with reasoning
+python rank.py --out submission.csv
+
+# Offline evaluation (requires eval/manual_labels.json)
+python scripts/05_eval.py
+
+# Validate submission
+python validate_submission.py submission.csv
+
+# Run sandbox demo
+streamlit run sandbox/app.py
+```
+
+---
+
+## Offline Evaluation (Ablation Results)
+
+Run on `dataset/sample_candidates.json` (50 candidates) with manual relevance labels.
+
+| Config | Description | NDCG@10 |
+|--------|-------------|---------|
+| A | BM25 only | — |
+| B | Dense (bge-base) only | — |
+| C | BM25 + Dense (RRF) | — |
+| D | C + structural features | — |
+| E | D + availability (additive) | — |
+| F | E + cross-encoder reranker | — |
+
+*Run `python scripts/05_eval.py` after adding manual labels to populate this table.*
+
+---
+
+## Key Design Decisions
+
+- **Encoder:** `BAAI/bge-base-en-v1.5` (768-dim) over `all-MiniLM-L6-v2` (384-dim). Ryzen 3 3250U constraint: bge-large = 8-10h; bge-base = 3-4h overnight. Quality gap bge-base→bge-large much smaller than MiniLM→bge-base.
+- **Cross-encoder:** `cross-encoder/ms-marco-MiniLM-L-6-v2` on top-500. ~35s on CPU. NDCG@10 is 50% of composite score — this directly targets the highest-weight metric.
+- **BM25 hybrid:** Catches exact technical terms (FAISS, Pinecone, Weaviate) that dense vectors dilute by averaging. RRF fusion is parameter-free and robust.
+- **jd_query.txt:** ~170-word focused requirements query for BGE embedding. Full `jd.txt` used only for Ollama reasoning prompts and BM25 tokens.
+- **Availability:** Additive signal (0.15 weight) alongside retrieval (0.50) and structural (0.35). Five sub-signals: open_to_work, recency, response_rate, notice_period, response_time + social_proof + reachability.
+- **Salary target:** 20-65 LPA (Series A India AI eng, 5-9 YoE). Wide range to reduce false negatives.
+- **Shared scoring module:** `scoring.py` imported by `rank.py`, `sandbox/app.py`, and `scripts/05_eval.py`. Single implementation, no formula drift.
+
+---
+
+## Repository Structure
+
+```
+├── rank.py                    # Main ranking script (judges reproduce this)
+├── scoring.py                 # Shared scoring module — single source of truth
+├── utils.py                   # Shared build_candidate_text()
+├── validate_submission.py     # Submission sanity checks
+├── jd.txt                     # Full job description
+├── jd_query.txt               # Compact ~170-word query (used for embedding + BM25)
+├── requirements.txt
+├── submission_metadata.yaml
+│
+├── scripts/
+│   ├── 01_extract_features.py
+│   ├── 02_embed_candidates.py
+│   ├── 03_embed_jd.py
+│   ├── 04_generate_reasoning.py
+│   └── 05_eval.py
+│
+├── precomputed/               # Generated by scripts. Pushed via Git LFS.
+│   ├── features.parquet       # ~15MB
+│   ├── candidate_embeddings.npy  # ~154MB (float16)
+│   ├── candidate_ids.txt
+│   ├── candidate_texts.pkl    # ~50MB
+│   ├── jd_embedding.npy
+│   └── reasoning_cache.json
+│
+├── sandbox/
+│   └── app.py                 # Streamlit demo
+│
+├── dataset/
+│   ├── sample_candidates.json # 50 sample candidates for offline eval
+│   └── job_description.docx
+│
+└── eval/
+    └── manual_labels.json     # NOT in git — create locally
+```
+
+---
+
+## Git LFS
+
+Large precomputed files tracked via Git LFS (free tier: 1 GB):
+
+```bash
+git lfs install
+git lfs track "*.npy" "*.parquet" "*.pkl"
+git add .gitattributes
+```
+
+File sizes: `candidate_embeddings.npy` ~154 MB, `features.parquet` ~15 MB, `candidate_texts.pkl` ~50 MB.  
+Total: ~220 MB — fits in free tier.
+
+To regenerate from scratch (verifies full pipeline):
+```bash
+python scripts/02_embed_candidates.py
+python scripts/03_embed_jd.py
+python rank.py --out submission.csv
+```

@@ -1,0 +1,4 @@
+precomputed/*.npy filter=lfs diff=lfs merge=lfs -text
+precomputed/*.parquet filter=lfs diff=lfs merge=lfs -text
+precomputed/*.pkl filter=lfs diff=lfs merge=lfs -text
+precomputed/reasoning_cache.json filter=lfs diff=lfs merge=lfs -text

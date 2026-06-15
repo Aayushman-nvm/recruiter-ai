@@ -1,0 +1,14 @@
+team_name: Redrob Ranker
+model_type: hybrid_retrieval_pipeline
+encoder: BAAI/bge-base-en-v1.5
+reranker: cross-encoder/ms-marco-MiniLM-L-6-v2
+retrieval_methods:
+  - BM25
+  - dense_cosine_similarity
+  - reciprocal_rank_fusion
+scoring_stages: 4
+max_runtime_minutes: 5
+cpu_only: true
+requires_gpu: false
+reasoning_model: phi3:mini
+reasoning_via_ollama: true
