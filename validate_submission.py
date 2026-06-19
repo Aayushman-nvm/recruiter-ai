@@ -1,117 +1,165 @@
+#!/usr/bin/env python3
 """
-validate_submission.py — Sanity checks for submission.csv.
-
-Usage: python validate_submission.py [submission.csv]
-
-Checks:
-  1. Exactly 100 rows
-  2. Required columns present (candidate_id, rank, score, reasoning)
-  3. Ranks 1–100, each used exactly once
-  4. candidate_ids unique
-  5. Scores non-increasing (rank 1 has highest score)
-  6. No missing candidate_ids or scores
+Validate submission CSV per challenge rules (sections 2–3).
+Row 1 = header. Rows 2–101 = exactly 100 data rows. CSV only.
 """
 
+import csv
+import re
 import sys
-import pandas as pd
+from pathlib import Path
+
+REQUIRED_HEADER = ["candidate_id", "rank", "score", "reasoning"]
+CANDIDATE_ID_PATTERN = re.compile(r"^CAND_[0-9]{7}$")
+DATA_ROW_START = 2
+EXPECTED_DATA_ROWS = 100
 
 
-def validate(path: str):
-    print(f"Validating: {path}")
+def validate_submission(csv_path):
     errors = []
-    warnings = []
+    path = Path(csv_path)
+
+    if path.suffix.lower() != ".csv":
+        errors.append("Filename must use a .csv extension.")
+    elif not path.stem:
+        errors.append("Filename must be your registered participant ID (e.g. team_xxx.csv).")
 
     try:
-        df = pd.read_csv(path)
-    except Exception as e:
-        print(f"FATAL: Could not read CSV: {e}")
-        sys.exit(1)
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
 
-    # 1. Row count
-    if len(df) != 100:
-        errors.append(f"Row count: expected 100, got {len(df)}")
-    else:
-        print(f"  ✓ 100 rows")
+            try:
+                header = next(reader)
+            except StopIteration:
+                errors.append("Row 1 must be the header row; file is empty.")
+                return errors
 
-    # 2. Required columns
-    required = {"candidate_id", "rank", "score", "reasoning"}
-    missing_cols = required - set(df.columns)
-    if missing_cols:
-        errors.append(f"Missing columns: {missing_cols}")
-    else:
-        print(f"  ✓ Required columns present")
+            # Row 1: column names and their order come from this line only
+            if header != REQUIRED_HEADER:
+                errors.append(
+                    "Row 1 (header) must be exactly:\n"
+                    f"  {','.join(REQUIRED_HEADER)}\n"
+                    f"Found:\n"
+                    f"  {','.join(header)}"
+                )
 
-    if errors:
-        # Can't continue without required columns
-        for e in errors:
-            print(f"  ✗ {e}")
-        sys.exit(1)
+            data_rows = []
+            for row in reader:
+                if any(cell.strip() for cell in row):
+                    data_rows.append(row)
 
-    # 3. Ranks 1–100, each exactly once
-    ranks = sorted(df["rank"].tolist())
-    if ranks != list(range(1, 101)):
-        errors.append(f"Ranks are not exactly 1–100. Got: {ranks[:5]}...")
-    else:
-        print(f"  ✓ Ranks 1–100, each used exactly once")
+    except UnicodeDecodeError:
+        errors.append("File must be UTF-8 encoded.")
+        return errors
+    except OSError as e:
+        errors.append(f"Cannot read file: {e}")
+        return errors
 
-    # 4. Unique candidate_ids
-    if df["candidate_id"].nunique() != len(df):
-        dupes = df[df["candidate_id"].duplicated()]["candidate_id"].tolist()
-        errors.append(f"Duplicate candidate_ids: {dupes}")
-    else:
-        print(f"  ✓ candidate_ids unique")
-
-    # 5. No null candidate_ids or scores
-    if df["candidate_id"].isnull().any():
-        errors.append("Null values in candidate_id column")
-    if df["score"].isnull().any():
-        errors.append("Null values in score column")
-    if not errors:
-        print(f"  ✓ No null candidate_ids or scores")
-
-    # 6. Scores non-increasing
-    # Sort by rank to ensure we check in rank order
-    df_sorted = df.sort_values("rank")
-    scores = df_sorted["score"].tolist()
-    violations = [
-        (i + 1, scores[i], scores[i + 1])
-        for i in range(len(scores) - 1)
-        if scores[i] < scores[i + 1]
-    ]
-    if violations:
+    n = len(data_rows)
+    if n != EXPECTED_DATA_ROWS:
         errors.append(
-            f"Score not non-increasing at {len(violations)} positions. "
-            f"First violation: rank {violations[0][0]} "
-            f"(score {violations[0][1]:.6f}) < rank {violations[0][0]+1} "
-            f"(score {violations[0][2]:.6f})"
+            f"After the header (row 1), there must be exactly {EXPECTED_DATA_ROWS} "
+            f"data rows (rows {DATA_ROW_START}–{DATA_ROW_START + EXPECTED_DATA_ROWS - 1}); "
+            f"found {n}."
         )
-    else:
-        print(f"  ✓ Scores monotonically non-increasing")
 
-    # 7. Reasoning column populated (warning, not error)
-    n_empty_reasoning = df["reasoning"].fillna("").eq("").sum()
-    if n_empty_reasoning > 0:
-        warnings.append(f"{n_empty_reasoning}/100 candidates have empty reasoning strings")
-    else:
-        print(f"  ✓ All 100 candidates have reasoning strings")
+    seen_ids = set()
+    seen_ranks = set()
+    by_rank = []
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    print()
-    if warnings:
-        for w in warnings:
-            print(f"  ⚠ Warning: {w}")
-    if errors:
-        print(f"\n❌ VALIDATION FAILED — {len(errors)} error(s):")
-        for e in errors:
-            print(f"   • {e}")
+    for i, cells in enumerate(data_rows):
+        row_num = DATA_ROW_START + i
+
+        if len(cells) != len(REQUIRED_HEADER):
+            errors.append(
+                f"Row {row_num}: expected {len(REQUIRED_HEADER)} columns "
+                f"({','.join(REQUIRED_HEADER)}), got {len(cells)}."
+            )
+            continue
+
+        row = dict(zip(REQUIRED_HEADER, cells))
+        cid = row["candidate_id"].strip()
+        rank_s = row["rank"].strip()
+        score_s = row["score"].strip()
+
+        if not cid:
+            errors.append(f"Row {row_num}: candidate_id is required.")
+        elif not CANDIDATE_ID_PATTERN.match(cid):
+            errors.append(
+                f"Row {row_num}: candidate_id must be CAND_XXXXXXX (7 digits)."
+            )
+        elif cid in seen_ids:
+            errors.append(f"Row {row_num}: duplicate candidate_id '{cid}'.")
+        else:
+            seen_ids.add(cid)
+
+        try:
+            rank = int(rank_s)
+            if str(rank) != rank_s:
+                raise ValueError
+            if not 1 <= rank <= 100:
+                errors.append(f"Row {row_num}: rank must be between 1 and 100.")
+            elif rank in seen_ranks:
+                errors.append(f"Row {row_num}: duplicate rank {rank}.")
+            else:
+                seen_ranks.add(rank)
+        except ValueError:
+            errors.append(f"Row {row_num}: rank must be an integer (1–100).")
+            rank = None
+
+        try:
+            score = float(score_s)
+        except ValueError:
+            errors.append(f"Row {row_num}: score must be a float.")
+            score = None
+
+        if rank is not None and score is not None and cid:
+            by_rank.append((rank, score, cid))
+
+    missing = set(range(1, 101)) - seen_ranks
+    if missing:
+        errors.append(
+            f"Each rank 1–100 must appear exactly once; missing: {sorted(missing)}"
+        )
+
+    by_rank.sort(key=lambda x: x[0])
+
+    for i in range(len(by_rank) - 1):
+        r1, s1, _ = by_rank[i]
+        r2, s2, _ = by_rank[i + 1]
+        if s1 < s2:
+            errors.append(
+                f"score must be non-increasing by rank: "
+                f"rank {r1} ({s1}) < rank {r2} ({s2})."
+            )
+
+    for i in range(len(by_rank) - 1):
+        r1, s1, c1 = by_rank[i]
+        r2, s2, c2 = by_rank[i + 1]
+        if s1 == s2 and c1 > c2:
+            errors.append(
+                f"Equal scores at ranks {r1} and {r2}: "
+                f"tie-break requires candidate_id ascending "
+                f"({c1!r} > {c2!r})."
+            )
+
+    return errors
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python validate_submission.py <participant_id>.csv")
         sys.exit(1)
-    else:
-        print("✅ All checks passed. Submission is valid.")
-        print(f"\nTop 5 candidates:")
-        top5 = df.sort_values("rank").head(5)[["rank", "candidate_id", "score"]]
-        print(top5.to_string(index=False))
+
+    errors = validate_submission(sys.argv[1])
+    if errors:
+        print(f"Validation failed ({len(errors)} issue(s)):\n")
+        for e in errors:
+            print(f"- {e}")
+        sys.exit(1)
+
+    print("Submission is valid.")
 
 
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else "submission.csv"
-    validate(path)
+    main()
