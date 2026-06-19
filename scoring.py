@@ -26,7 +26,7 @@ TARGET_CITIES = {
 IT_SERVICES_COMPANIES = {
     "tcs", "tata consultancy", "infosys", "wipro", "accenture",
     "cognizant", "capgemini", "mindtree", "mphasis", "hexaware",
-    "ltimindtree", "tech mahindra", "hcl technologies", "hcltech",
+    "ltimindtree", "tech mahindra", "hcl technologies", "hcltech", "hcl",
     "ibm global", "atos", "dxc technology", "epam", "niit technologies",
 }
 
@@ -117,6 +117,9 @@ def compute_company_fit(
         ml_recency = 0.20
 
     if has_product_company_exp and has_ml_production_experience:
+        # Guard: sentinel 99.0 means "never did ML" — treat as no ML experience
+        if years_since_last_ml_role >= 99.0:
+            return 0.65   # product, no ML (sentinel case)
         # Floor at 0.65 — stale ML always beats no-ML-at-all (Bug 2 fix)
         return max(0.65, 1.0 * ml_recency)
     elif has_product_company_exp:
@@ -339,13 +342,13 @@ def generate_reasoning(row: dict) -> str:
 
     elif has_ml and 1 < yrs_since_ml <= 3:
         # ML experience but somewhat stale
-        s1 = (f"{title} with {yoe_str} years of experience who last worked in ML "
-              f"{yrs_since_ml:.1f} years ago at {company_str}, bringing relevant but dated production experience.")
+        s1 = (f"{title} with {yoe_str} years of experience who last worked in a production ML role "
+              f"{yrs_since_ml:.1f} years ago at {company_str}, bringing relevant but dated hands-on experience.")
 
     elif has_ml and yrs_since_ml > 3:
         # ML experience, notably stale
-        s1 = (f"{title} with {yoe_str} years of experience whose ML production background "
-              f"is {yrs_since_ml:.1f} years old, raising questions about currency of hands-on skills.")
+        s1 = (f"{title} with {yoe_str} years of experience whose most recent production ML role "
+              f"was {yrs_since_ml:.1f} years ago — the role requires active hands-on ML work, not historical.")
 
     elif has_product and not has_ml:
         # Product company but no ML keywords detected
