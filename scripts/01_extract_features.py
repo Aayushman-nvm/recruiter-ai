@@ -20,6 +20,12 @@ from datetime import date
 import pandas as pd
 from tqdm import tqdm
 
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
 from scoring import (
     TARGET_CITIES, IT_SERVICES_COMPANIES,
     compute_skill_assessment_bonus, compute_education_bonus,

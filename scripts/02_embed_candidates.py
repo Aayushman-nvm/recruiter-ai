@@ -59,8 +59,8 @@ sys.path.insert(0, str(ROOT))
 from utils import build_candidate_text  # noqa: E402 (import after sys.path insert)
 
 # ── Configuration ───────────────────────────────────────────────────────────────
-MODEL_NAME  = "BAAI/bge-base-en-v1.5"   # 438MB, 768-dim — do NOT change
-EMBED_DIM   = 768
+MODEL_NAME  = "all-MiniLM-L6-v2"   
+EMBED_DIM   = 384
 
 # Batch size for model.encode() — affects GPU/CPU throughput and peak RAM.
 # At 64: ~0.2MB RAM for one batch of float32 embeddings. Safe for 8GB systems.

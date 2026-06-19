@@ -22,7 +22,13 @@ import os
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-MODEL_NAME = "BAAI/bge-base-en-v1.5"
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+MODEL_NAME = "all-MiniLM-L6-v2"
 # BGE query-side instruction prefix (required for asymmetric encoding)
 BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 
