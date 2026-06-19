@@ -1,5 +1,5 @@
 sentence-transformers
-rank-bm25
+bm25s
 pandas
 numpy
 pyarrow
