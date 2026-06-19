@@ -101,14 +101,16 @@ def extract_features(c: dict) -> dict:
     )
 
     # ── ML production experience ─────────────────────────────────────────
-    cutoff = date(REFERENCE_DATE.year - 6, REFERENCE_DATE.month, REFERENCE_DATE.day)
+    # Scan ALL career history roles (not just recent 6 years).
+    # The 6-year cutoff was discarding valid ML roles that started slightly before
+    # the window, even if they ran until recently. years_since_last_ml_role already
+    # captures recency — we don't need a hard cutoff here.
     has_ml_production_experience = False
-    years_since_last_ml_role = float(yoe)  # worst-case: never did ML
+    # Sentinel 99.0 = "never did ML" — distinct from yoe and handled explicitly
+    # in compute_company_fit (ml_recency branch) and generate_reasoning (has_ml guard)
+    years_since_last_ml_role = 99.0
 
     for role in career:
-        start = parse_date(role.get("start_date"))
-        if start is None or start < cutoff:
-            continue
         desc = (role.get("description") or "").lower()
         if any(kw in desc for kw in ML_KEYWORDS):
             has_ml_production_experience = True
