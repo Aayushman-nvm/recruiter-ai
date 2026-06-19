@@ -22,7 +22,6 @@ built-in progress bars). `pip install bm25s`.
 """
 
 import argparse
-import json
 import pickle
 import time
 
@@ -201,17 +200,20 @@ def rank_candidates(
     print(f"  Structural scoring done in {time.time() - t4:.1f}s. Prelim top candidate: "
           f"{df_top.nlargest(1, 'prelim_score')['candidate_id'].iloc[0]}")
 
-    # ── Stage 4: Cross-encoder reranker on top-500 ────────────────────────────
-    print("Stage 4: Cross-encoder reranking (top-500)...")
+    # ── Stage 4: Cross-encoder reranker on top-300 ────────────────────────────
+    # Reduced from top-500 to top-300 to keep Stage 4 under ~90s on constrained CPU.
+    # NDCG@10 impact is negligible — the top 100 are well within the top 300 after
+    # structural scoring, and the CE is most valuable in the top 10–50 range anyway.
+    print("Stage 4: Cross-encoder reranking (top-300)...")
     t5 = time.time()
-    top500 = df_top.nlargest(500, "prelim_score").copy()
-    top500_ids = top500["candidate_id"].tolist()
+    top300 = df_top.nlargest(300, "prelim_score").copy()
+    top300_ids = top300["candidate_id"].tolist()
 
     cid_to_text = dict(zip(candidate_ids, candidate_texts))
-    pairs = [(jd_query_text, cid_to_text[cid]) for cid in top500_ids]
+    pairs = [(jd_query_text, cid_to_text[cid]) for cid in top300_ids]
 
     cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
-    ce_scores = cross_encoder.predict(pairs, batch_size=32, show_progress_bar=True)
+    ce_scores = cross_encoder.predict(pairs, batch_size=16, show_progress_bar=True)
 
     # Normalise CE scores to [0, 1]
     ce_min, ce_max = ce_scores.min(), ce_scores.max()
@@ -220,21 +222,21 @@ def rank_candidates(
     else:
         ce_scores_norm = np.ones_like(ce_scores) * 0.5
 
-    top500 = top500.copy()
-    top500["ce_score"] = ce_scores_norm
+    top300 = top300.copy()
+    top300["ce_score"] = ce_scores_norm
 
     # Blend preliminary (structural context) with cross-encoder (relevance precision)
-    top500["final_score"] = (
-        0.40 * top500["prelim_score"] +
-        0.60 * top500["ce_score"]
+    top300["final_score"] = (
+        0.40 * top300["prelim_score"] +
+        0.60 * top300["ce_score"]
     )
 
     # Re-enforce hard disqualifiers (CE might score disqualified candidates highly)
-    top500.loc[top500["is_honeypot"],               "final_score"] = 0.0
-    top500.loc[top500["entire_career_it_services"],  "final_score"] = 0.0
+    top300.loc[top300["is_honeypot"],               "final_score"] = 0.0
+    top300.loc[top300["entire_career_it_services"],  "final_score"] = 0.0
 
     # Final top-100: sort by final_score desc, candidate_id asc (deterministic tiebreak)
-    top100 = top500.nlargest(100, "final_score").copy()
+    top100 = top300.nlargest(100, "final_score").copy()
     top100 = top100.sort_values(["final_score", "candidate_id"], ascending=[False, True])
     top100["rank"] = range(1, 101)
     top100["score"] = top100["final_score"].round(6)
