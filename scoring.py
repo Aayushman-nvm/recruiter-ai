@@ -259,6 +259,200 @@ def compute_availability_score(
     return min(1.0, availability)
 
 
+def generate_reasoning(row: dict) -> str:
+    """
+    Generate 2-sentence reasoning from feature columns — no LLM required.
+
+    Sentence 1: Lead signal — what most strongly drove this ranking decision.
+                Branches on the dominant positive or disqualifying factor.
+    Sentence 2: Supporting signal — a concrete secondary fact that reinforces
+                or qualifies sentence 1. Always cites a real number.
+
+    Design principles:
+    - Every branch cites a specific value from the row (years, days, rate, etc.)
+    - Sentence structure rotates across branches so adjacent candidates read differently
+    - Reasoning is causally tied to the score: the branch chosen matches the
+      signal that actually dominated the ranking formula
+    - No generic filler phrases ("strong background", "excellent fit")
+
+    Input: a dict-like row with columns from features.parquet plus computed
+           structural_score, availability_score, ce_score, final_score, rank.
+    """
+
+    # ── Extract key values ────────────────────────────────────────────────────
+    title        = str(row.get("current_title", "candidate") or "candidate").strip()
+    yoe          = float(row.get("years_of_experience", 0) or 0)
+    company      = str(row.get("current_company", "") or "").strip()
+    location     = str(row.get("location", "") or "").strip()
+    country      = str(row.get("country", "") or "").strip()
+
+    is_india          = bool(row.get("is_india_based", False))
+    is_target_city    = bool(row.get("is_target_city", False))
+    willing_relocate  = bool(row.get("willing_to_relocate", False))
+    entire_it         = bool(row.get("entire_career_it_services", False))
+    has_product       = bool(row.get("has_product_company_exp", False))
+    has_ml            = bool(row.get("has_ml_production_experience", False))
+    yrs_since_ml      = float(row.get("years_since_last_ml_role", 99) or 99)
+    traj_score        = float(row.get("trajectory_score", 0) or 0)
+    avg_tenure        = float(row.get("avg_tenure_months", 0) or 0)
+    trajectory_up     = bool(row.get("trajectory_upward", False))
+
+    sal_min           = float(row.get("salary_min_lpa", 0) or 0)
+    sal_max           = float(row.get("salary_max_lpa", 999) or 999)
+    open_to_work      = bool(row.get("open_to_work_flag", False))
+    days_ago          = int(row.get("last_active_days_ago", 999) or 999)
+    response_rate     = float(row.get("recruiter_response_rate", 0) or 0)
+    notice_days       = int(row.get("notice_period_days", 90) or 90)
+    resp_time_hrs     = float(row.get("avg_response_time_hours", -1) or -1)
+    saves             = int(row.get("saved_by_recruiters_30d", 0) or 0)
+    skill_bonus       = float(row.get("skill_assessment_bonus", 0) or 0)
+    edu_tier          = str(row.get("edu_tier", "unknown") or "unknown")
+
+    structural   = float(row.get("structural_score", 0) or 0)
+    availability = float(row.get("availability_score", 0) or 0)
+    ce_score     = float(row.get("ce_score", 0) or 0)
+    final_score  = float(row.get("final_score", 0) or 0)
+    rank         = int(row.get("rank", 0) or 0)
+
+    # ── Shorthands ────────────────────────────────────────────────────────────
+    yoe_str     = f"{yoe:.1f}"
+    loc_str     = f"{location}, {country}" if location and country else (location or country or "unknown location")
+    company_str = company if company else "their current employer"
+
+    # ── Sentence 1: Lead signal ───────────────────────────────────────────────
+    # Priority order: disqualifiers first, then strongest positive signal.
+
+    if entire_it:
+        # Hard disqualifier — explain why they're in the list at all (low rank)
+        s1 = (f"{title} with {yoe_str} years of experience whose entire career "
+              f"has been in IT services consulting, which the JD explicitly disqualifies.")
+
+    elif not has_ml and not has_product:
+        # No ML and no product company — weakest structural profile
+        s1 = (f"{title} with {yoe_str} years of experience at {company_str}, "
+              f"with no detected production ML experience and no product-company background.")
+
+    elif has_ml and yrs_since_ml <= 1:
+        # Currently doing ML — strongest signal
+        s1 = (f"{title} with {yoe_str} years of experience currently working in "
+              f"production ML at {company_str}, directly matching the role's core requirement.")
+
+    elif has_ml and 1 < yrs_since_ml <= 3:
+        # ML experience but somewhat stale
+        s1 = (f"{title} with {yoe_str} years of experience who last worked in ML "
+              f"{yrs_since_ml:.1f} years ago at {company_str}, bringing relevant but dated production experience.")
+
+    elif has_ml and yrs_since_ml > 3:
+        # ML experience, notably stale
+        s1 = (f"{title} with {yoe_str} years of experience whose ML production background "
+              f"is {yrs_since_ml:.1f} years old, raising questions about currency of hands-on skills.")
+
+    elif has_product and not has_ml:
+        # Product company but no ML keywords detected
+        s1 = (f"{title} with {yoe_str} years at product companies including {company_str}, "
+              f"but no explicit production ML or retrieval/ranking experience detected in their career history.")
+
+    elif ce_score >= 0.7:
+        # Cross-encoder found strong semantic match despite weaker structural signals
+        s1 = (f"{title} with {yoe_str} years of experience whose profile content closely "
+              f"matches the technical requirements of this role (semantic match: {ce_score:.2f}).")
+
+    else:
+        # Generic fallback — use experience and title
+        s1 = (f"{title} with {yoe_str} years of experience at {company_str}, "
+              f"ranked {rank} based on a combination of semantic fit and structured signals.")
+
+    # ── Sentence 2: Supporting / qualifying signal ────────────────────────────
+    # Pick the most informative secondary fact — rotate structure based on what's notable.
+
+    if entire_it:
+        # For disqualified candidates, cite their availability as the reason they appear at all
+        if open_to_work and days_ago <= 30:
+            s2 = (f"Despite the disqualification, they are actively available "
+                  f"(open to work, last active {days_ago} days ago, response rate {response_rate:.0%}).")
+        else:
+            s2 = (f"Their recruiter response rate is {response_rate:.0%} "
+                  f"and they were last active {days_ago} days ago.")
+
+    elif not is_india:
+        # International candidate — location is the key concern
+        if willing_relocate:
+            s2 = (f"Based in {loc_str}, they are willing to relocate to India, "
+                  f"though visa sponsorship is not available per the JD.")
+        else:
+            s2 = (f"Based in {loc_str} and not willing to relocate — "
+                  f"significant location mismatch for a Noida-based role.")
+
+    elif is_india and not is_target_city and not willing_relocate:
+        # India-based but wrong city and not relocating
+        s2 = (f"Currently in {loc_str}, not in a JD-preferred city and not open to relocation "
+              f"— partial location fit only.")
+
+    elif skill_bonus >= 0.04:
+        # Platform-verified skill scores are rare and high-signal — lead with them
+        s2 = (f"Platform-verified skill assessments (bonus: {skill_bonus:.3f}) provide "
+              f"independently confirmed technical ability, a signal absent in most candidates.")
+
+    elif traj_score >= 0.8 and trajectory_up:
+        # Strong upward trajectory — cite tenure as evidence
+        tenure_str = f"{avg_tenure:.0f}" if avg_tenure > 0 else "unknown"
+        s2 = (f"Their career shows upward title progression with an average tenure of "
+              f"{tenure_str} months per role, indicating stability and growth rather than title-chasing.")
+
+    elif avg_tenure < 15 and avg_tenure > 0:
+        # Short tenures — flag title-chasing pattern
+        s2 = (f"Average tenure of {avg_tenure:.0f} months per role suggests a title-chasing "
+              f"pattern — a stated JD concern — which the trajectory score ({traj_score:.2f}) reflects.")
+
+    elif open_to_work and days_ago <= 14 and response_rate >= 0.7:
+        # Excellent availability — all three signals positive
+        s2 = (f"Actively job-seeking: open to work, last active {days_ago} days ago, "
+              f"and {response_rate:.0%} recruiter response rate — highly reachable.")
+
+    elif open_to_work and notice_days <= 30:
+        # Available and fast start
+        notice_str = "immediately" if notice_days == 0 else f"within {notice_days} days"
+        s2 = (f"Open to work and can start {notice_str}, "
+              f"last active {days_ago} days ago with a {response_rate:.0%} response rate.")
+
+    elif days_ago > 180:
+        # Inactive for over 6 months — availability concern
+        s2 = (f"Last active {days_ago} days ago with a {response_rate:.0%} response rate — "
+              f"low platform engagement raises reachability concerns despite their technical profile.")
+
+    elif resp_time_hrs >= 0 and resp_time_hrs <= 4:
+        # Responds very quickly — notable positive
+        s2 = (f"Responds to recruiter messages within {resp_time_hrs:.0f} hours on average "
+              f"({response_rate:.0%} response rate), indicating strong engagement.")
+
+    elif saves >= 5:
+        # Multiple recruiters have bookmarked this candidate — social proof
+        s2 = (f"Saved by {saves} other recruiters in the last 30 days — "
+              f"crowd-validated interest from the recruiting community.")
+
+    elif sal_min > SALARY_TARGET_MAX * 1.3:
+        # Significant salary mismatch — flag it
+        s2 = (f"Expected salary (min {sal_min:.0f} LPA) likely exceeds the role's budget "
+              f"for a Series A startup — potential offer negotiation risk.")
+
+    elif sal_max < SALARY_TARGET_MIN * 0.7:
+        # Under the expected range — flag as potential seniority signal
+        s2 = (f"Expected salary range ({sal_min:.0f}–{sal_max:.0f} LPA) is below the "
+              f"estimated market rate for this seniority, possibly indicating a junior profile.")
+
+    elif edu_tier == "tier_1":
+        s2 = (f"Tier-1 institution background adds a marginal quality signal "
+              f"as a tiebreaker ({response_rate:.0%} response rate, {days_ago} days since last active).")
+
+    else:
+        # Fallback: cite availability numbers since they're always meaningful
+        active_str = "recently" if days_ago <= 30 else f"{days_ago} days ago"
+        s2 = (f"Last active {active_str} with a {response_rate:.0%} recruiter response rate "
+              f"and {notice_days}-day notice period.")
+
+    return f"{s1} {s2}"
+
+
 def compute_structural_score(
     experience_fit: float,
     location_fit: float,

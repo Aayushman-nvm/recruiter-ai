@@ -8,22 +8,29 @@ Hard constraints:
   ≤ 5 min wall-clock | ≤ 16 GB RAM | CPU only | no network calls
 
 Pipeline:
-  Stage 1: BM25 keyword retrieval   (~3s for 100K)
+  Stage 1: BM25 keyword retrieval   (bm25s, vectorized — ~2-5s for 100K)
   Stage 2: Dense cosine similarity  (~1s for 100K)
   Fusion:  RRF → shortlist top-2000
   Stage 3: Structural + availability scoring on top-2000
-  Stage 4: Cross-encoder reranker on top-500  (~35s on CPU)
+  Stage 4: Cross-encoder reranker on top-500  (slowest stage on weak CPUs, ~60-180s)
   Output:  final top-100
+
+NOTE: Stage 1 previously used rank_bm25 (pure-Python dict-based index).
+On constrained hardware (<8GB RAM, weak CPU) that stage can stall for minutes
+and push memory into swap. Replaced with bm25s (scipy-sparse, vectorized,
+built-in progress bars). `pip install bm25s`.
 """
 
 import argparse
 import json
 import pickle
+import time
 
+import bm25s
 import numpy as np
 import pandas as pd
-from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
+from tqdm import tqdm
 
 from scoring import (
     compute_availability_score,
@@ -32,6 +39,7 @@ from scoring import (
     compute_location_fit,
     compute_salary_fit,
     compute_structural_score,
+    generate_reasoning,
 )
 
 CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -97,36 +105,48 @@ def rank_candidates(
     """
 
     # ── Stage 1: BM25 keyword retrieval ──────────────────────────────────────
-    print("Stage 1: Building BM25 index...")
-    tokenized = [text.lower().split() for text in candidate_texts]
-    bm25 = BM25Okapi(tokenized)   # ~3s for 100K candidates
+    print("Stage 1: BM25 (bm25s)...")
+    t1 = time.time()
+
+    # bm25s: scipy-sparse + vectorized scoring. Built-in tqdm progress bars
+    # (show_progress=True below) replace the old silent rank_bm25 indexing step.
+    corpus_tokens = bm25s.tokenize(candidate_texts, stopwords=None, show_progress=True)
+    bm25_retriever = bm25s.BM25()
+    bm25_retriever.index(corpus_tokens, show_progress=True)
 
     # BM25 uses jd_query.txt — focused tokens reduce false positives vs full JD prose
     with open("jd_query.txt", encoding="utf-8") as f:
         jd_query_text = f.read().strip()
-    jd_tokens = jd_query_text.lower().split()
-    bm25_raw = bm25.get_scores(jd_tokens)   # shape: (N,)
-    bm25_ranked = [candidate_ids[i] for i in np.argsort(-bm25_raw)]
-    print(f"  BM25 done. Top candidate: {bm25_ranked[0]}")
+    query_tokens = bm25s.tokenize(jd_query_text, stopwords=None, show_progress=False)
+
+    # Full ranking over all N candidates (needed for RRF rank positions below)
+    bm25_indices, _bm25_scores = bm25_retriever.retrieve(
+        query_tokens, k=len(candidate_ids), show_progress=True
+    )
+    bm25_ranked = [candidate_ids[i] for i in bm25_indices[0]]
+    print(f"  BM25 done in {time.time() - t1:.1f}s. Top candidate: {bm25_ranked[0]}")
 
     # ── Stage 2: Dense cosine similarity ─────────────────────────────────────
     print("Stage 2: Dense similarity...")
+    t2 = time.time()
     # Dot product works because both embeddings are L2-normalised
     dense_scores = embeddings @ jd_embedding   # shape: (N,), ~1s
     dense_ranked = [candidate_ids[i] for i in np.argsort(-dense_scores)]
-    print(f"  Dense done. Top candidate: {dense_ranked[0]}")
+    print(f"  Dense done in {time.time() - t2:.1f}s. Top candidate: {dense_ranked[0]}")
 
     # ── Fusion: RRF → shortlist top-2000 ─────────────────────────────────────
     print("Fusion: RRF → top-2000 shortlist...")
+    t3 = time.time()
     rrf_scores = rrf_fusion(bm25_ranked, dense_ranked)
     top2000_ids = sorted(rrf_scores.keys(), key=lambda cid: -rrf_scores[cid])[:2000]
     top2000_set = set(top2000_ids)
 
     df_top = df[df["candidate_id"].isin(top2000_set)].copy()
-    print(f"  Shortlisted {len(df_top)} candidates.")
+    print(f"  Shortlisted {len(df_top)} candidates in {time.time() - t3:.1f}s.")
 
     # ── Stage 3: Structural + availability scoring ────────────────────────────
     print("Stage 3: Structural + availability scoring...")
+    t4 = time.time()
 
     def row_structural(row) -> float:
         exp_fit  = compute_experience_fit(row["years_of_experience"])
@@ -145,6 +165,7 @@ def rank_candidates(
         )
 
     def row_availability(row) -> float:
+        # interview_completion_rate intentionally excluded — removed from signature (I1 fix)
         return compute_availability_score(
             row["open_to_work_flag"],
             row["last_active_days_ago"],
@@ -156,8 +177,10 @@ def rank_candidates(
             row["verified_phone"],
         )
 
-    df_top["structural_score"]  = df_top.apply(row_structural, axis=1)
-    df_top["availability_score"] = df_top.apply(row_availability, axis=1)
+    tqdm.pandas(desc="Structural")
+    df_top["structural_score"]  = df_top.progress_apply(row_structural, axis=1)
+    tqdm.pandas(desc="Availability")
+    df_top["availability_score"] = df_top.progress_apply(row_availability, axis=1)
 
     # Attach and normalise RRF scores
     df_top["rrf_score"] = df_top["candidate_id"].map(rrf_scores)
@@ -175,11 +198,12 @@ def rank_candidates(
     df_top.loc[df_top["is_honeypot"],                "prelim_score"] = 0.0
     df_top.loc[df_top["entire_career_it_services"],   "prelim_score"] = 0.0
 
-    print(f"  Structural scoring done. Prelim top candidate: "
+    print(f"  Structural scoring done in {time.time() - t4:.1f}s. Prelim top candidate: "
           f"{df_top.nlargest(1, 'prelim_score')['candidate_id'].iloc[0]}")
 
     # ── Stage 4: Cross-encoder reranker on top-500 ────────────────────────────
     print("Stage 4: Cross-encoder reranking (top-500)...")
+    t5 = time.time()
     top500 = df_top.nlargest(500, "prelim_score").copy()
     top500_ids = top500["candidate_id"].tolist()
 
@@ -215,12 +239,13 @@ def rank_candidates(
     top100["rank"] = range(1, 101)
     top100["score"] = top100["final_score"].round(6)
 
-    print(f"  Cross-encoder done. Top candidate: {top100.iloc[0]['candidate_id']}")
+    print(f"  Cross-encoder done in {time.time() - t5:.1f}s. Top candidate: {top100.iloc[0]['candidate_id']}")
+    print(f"  Total ranking time: {time.time() - t1:.1f}s")
     return top100
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Reasoning attachment
+# Reasoning generation (deterministic — no LLM required)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -230,33 +255,30 @@ def attach_reasoning(
     no_reasoning: bool,
 ) -> pd.DataFrame:
     """
-    Attach reasoning strings from reasoning_cache.json to the top-100 DataFrame.
-    If --no-reasoning flag is set, writes top100_ids.txt for Script 04 and returns empty strings.
+    Generate reasoning for each of the top-100 candidates.
+
+    Reasoning is produced deterministically from features.parquet columns
+    using generate_reasoning() in scoring.py. No Ollama, no network calls.
+
+    --no-reasoning flag: skip generation, write top100_ids.txt (used by old
+    Script 04 workflow — kept for backward compatibility), return empty strings.
     """
+    top100 = top100.copy()
     ids = top100["candidate_id"].tolist()
 
     if no_reasoning:
         with open(f"{precomputed_dir}/top100_ids.txt", "w") as f:
             f.write("\n".join(ids))
-        print(f"Wrote {precomputed_dir}/top100_ids.txt (run scripts/04_generate_reasoning.py next)")
-        top100 = top100.copy()
+        print(f"Wrote {precomputed_dir}/top100_ids.txt")
         top100["reasoning"] = ""
         return top100
 
-    cache_path = f"{precomputed_dir}/reasoning_cache.json"
-    try:
-        with open(cache_path) as f:
-            cache = json.load(f)
-        top100 = top100.copy()
-        top100["reasoning"] = top100["candidate_id"].map(cache).fillna("")
-    except FileNotFoundError:
-        with open(f"{precomputed_dir}/top100_ids.txt", "w") as f:
-            f.write("\n".join(ids))
-        print(f"reasoning_cache.json not found. Wrote top100_ids.txt.")
-        print("Run: python scripts/04_generate_reasoning.py")
-        top100 = top100.copy()
-        top100["reasoning"] = ""
-
+    print("Generating reasoning from feature signals (no LLM)...")
+    top100["reasoning"] = top100.apply(
+        lambda row: generate_reasoning(row.to_dict()), axis=1
+    )
+    n_populated = top100["reasoning"].str.len().gt(0).sum()
+    print(f"  Generated reasoning for {n_populated}/100 candidates.")
     return top100
 
 
