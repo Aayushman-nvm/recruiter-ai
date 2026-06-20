@@ -15,6 +15,7 @@ compute_education_bonus from scoring.py — single authoritative source.
 import gzip
 import json
 import os
+import re
 from datetime import date
 
 import pandas as pd
@@ -56,8 +57,29 @@ ML_KEYWORDS = [
     "bert", "transformer", "nlp", "information retrieval", "learning to rank",
     "xgboost ranking", "neural ranker", "reranker", "dense retrieval",
     "search engine", "knowledge graph", "question answering", "vector database",
-    "approximate nearest neighbor", "ann", "hnsw", "cosine similarity"
+    "approximate nearest neighbor", "hnsw", "cosine similarity"
 ]
+# Dropped bare "ann" — confirmed root cause of has_ml_production_experience being
+# True on ~52% of completely unrelated titles (HR Manager, Accountant, Civil
+# Engineer, ...). "ann" as a naive substring matched inside "channel", "planning",
+# "announce", etc. The full phrase "approximate nearest neighbor" above already
+# covers the legitimate case; "hnsw" covers the other common spelling.
+#
+# Matching now requires a leading word boundary (re.search(r"\bKEYWORD", desc))
+# instead of plain `kw in desc`. A *leading* boundary (not a trailing one) was
+# chosen deliberately: stems like "fine-tun" and "sentence-transformer" are meant
+# to also match "fine-tuning"/"sentence-transformers", so they can't require a
+# boundary at the end. A leading boundary alone is enough to stop "llm" matching
+# inside "fulfillment" (no boundary before "llm" there) and "bert" matching inside
+# "Robert"/"Albert" (no boundary before "bert" there), while still matching every
+# legitimate case (a keyword preceded by whitespace, punctuation, or string start).
+ML_KEYWORD_PATTERN = re.compile(
+    r"\b(?:" + "|".join(re.escape(kw) for kw in ML_KEYWORDS) + r")"
+)
+
+
+def _has_ml_keyword(desc: str) -> bool:
+    return ML_KEYWORD_PATTERN.search(desc) is not None
 
 DATA_PATH = "data/candidates.jsonl.gz"
 OUT_PATH  = "precomputed/features.parquet"
@@ -112,7 +134,7 @@ def extract_features(c: dict) -> dict:
 
     for role in career:
         desc = (role.get("description") or "").lower()
-        if any(kw in desc for kw in ML_KEYWORDS):
+        if _has_ml_keyword(desc):
             has_ml_production_experience = True
             end_raw = role.get("end_date")
             end = parse_date(end_raw) if end_raw else REFERENCE_DATE
