@@ -3,22 +3,42 @@ rank.py — 4-stage candidate ranking pipeline.
 
 Usage:
   python rank.py [--precomputed precomputed/] [--out submission.csv] [--no-reasoning]
+                  [--ce-topn 500]
 
 Hard constraints:
   ≤ 5 min wall-clock | ≤ 16 GB RAM | CPU only | no network calls
 
 Pipeline:
-  Stage 1: BM25 keyword retrieval   (bm25s, vectorized — ~2-5s for 100K)
-  Stage 2: Dense cosine similarity  (~1s for 100K)
-  Fusion:  RRF → shortlist top-2000
+  Stage 1: BM25 keyword retrieval        (bm25s, vectorized — ~2-5s for 100K)
+  Stage 2: Dense cosine similarity       (~1s for 100K)
+  Fusion:  weighted score fusion → shortlist top-2000  (see scoring.py)
   Stage 3: Structural + availability scoring on top-2000
-  Stage 4: Cross-encoder reranker on top-500  (slowest stage on weak CPUs, ~60-180s)
+  Stage 4: Cross-encoder reranker on top-N  (slowest stage on weak CPUs)
   Output:  final top-100
 
 NOTE: Stage 1 previously used rank_bm25 (pure-Python dict-based index).
 On constrained hardware (<8GB RAM, weak CPU) that stage can stall for minutes
 and push memory into swap. Replaced with bm25s (scipy-sparse, vectorized,
 built-in progress bars). `pip install bm25s`.
+
+Fusion was changed from Reciprocal Rank Fusion to a weighted min-max score
+fusion — RRF discards how confident each retrieval method was (rank position
+only), which let borderline keyword matches tie with strong semantic matches.
+See weighted_score_fusion() in scoring.py for the full rationale.
+
+Stage 4 (--ce-topn, default 500): widened from a prior 300 back to 500 now
+that the false-positive-bug fixes elsewhere freed up the time budget for it.
+Cross-encoder cost is linear in N candidates and dominates total wall time, so
+two accuracy-neutral speedups were added to make room instead of just eating
+the extra ~110s:
+  1. Pairs are sorted by text length before batching, then unsorted after
+     predict() — `batch_size` pads every item in a batch to the longest item
+     in that batch, so grouping similar lengths together cuts wasted padding
+     compute. Does not change any individual prediction, only batch order.
+  2. batch_size raised 16 -> 32 (re-benchmark on your hardware; CPU batching
+     gains are less predictable than on GPU — revert if it's not faster).
+If --ce-topn 500 still doesn't fit your 5-minute budget after these, dial it
+down (e.g. --ce-topn 400) — no code changes needed.
 """
 
 import argparse
@@ -32,6 +52,11 @@ from sentence_transformers import CrossEncoder
 from tqdm import tqdm
 
 from scoring import (
+    FINAL_CE_WEIGHT,
+    FINAL_PRELIM_WEIGHT,
+    PRELIM_AVAILABILITY_WEIGHT,
+    PRELIM_FUSION_WEIGHT,
+    PRELIM_STRUCTURAL_WEIGHT,
     compute_availability_score,
     compute_company_fit,
     compute_experience_fit,
@@ -39,6 +64,7 @@ from scoring import (
     compute_salary_fit,
     compute_structural_score,
     generate_reasoning,
+    weighted_score_fusion,
 )
 
 CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -68,25 +94,6 @@ def load_precomputed(precomputed_dir: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RRF fusion
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def rrf_fusion(rank_list_a: list, rank_list_b: list, k: int = 60) -> dict:
-    """
-    Reciprocal Rank Fusion.
-    Combines BM25 and dense rankings without normalising heterogeneous score distributions.
-    k=60 is the standard default from the original RRF paper.
-    """
-    scores = {}
-    for rank, cid in enumerate(rank_list_a):
-        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank + 1)
-    for rank, cid in enumerate(rank_list_b):
-        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank + 1)
-    return scores
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Main ranking logic
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -97,6 +104,7 @@ def rank_candidates(
     embeddings: np.ndarray,
     jd_embedding: np.ndarray,
     candidate_texts: list,
+    ce_topn: int = 500,
 ) -> pd.DataFrame:
     """
     Run the 4-stage ranking pipeline.
@@ -118,26 +126,34 @@ def rank_candidates(
         jd_query_text = f.read().strip()
     query_tokens = bm25s.tokenize(jd_query_text, stopwords=None, show_progress=False)
 
-    # Full ranking over all N candidates (needed for RRF rank positions below)
-    bm25_indices, _bm25_scores = bm25_retriever.retrieve(
+    # Full ranking over all N candidates. retrieve() returns indices/scores in
+    # descending-score order (not candidate_ids order) — scatter back into
+    # candidate_ids-aligned position so bm25_raw[i] lines up with candidate_ids[i]
+    # and dense_scores[i] below. Raw scores (not just rank position) are needed
+    # for weighted_score_fusion.
+    bm25_indices, bm25_scores_sorted = bm25_retriever.retrieve(
         query_tokens, k=len(candidate_ids), show_progress=True
     )
-    bm25_ranked = [candidate_ids[i] for i in bm25_indices[0]]
-    print(f"  BM25 done in {time.time() - t1:.1f}s. Top candidate: {bm25_ranked[0]}")
+    bm25_raw = np.empty(len(candidate_ids), dtype=np.float64)
+    bm25_raw[bm25_indices[0]] = bm25_scores_sorted[0]
+    print(f"  BM25 done in {time.time() - t1:.1f}s. "
+          f"Top candidate: {candidate_ids[bm25_indices[0][0]]}")
 
     # ── Stage 2: Dense cosine similarity ─────────────────────────────────────
     print("Stage 2: Dense similarity...")
     t2 = time.time()
     # Dot product works because both embeddings are L2-normalised
     dense_scores = embeddings @ jd_embedding   # shape: (N,), ~1s
-    dense_ranked = [candidate_ids[i] for i in np.argsort(-dense_scores)]
-    print(f"  Dense done in {time.time() - t2:.1f}s. Top candidate: {dense_ranked[0]}")
+    print(f"  Dense done in {time.time() - t2:.1f}s. "
+          f"Top candidate: {candidate_ids[int(np.argmax(dense_scores))]}")
 
-    # ── Fusion: RRF → shortlist top-2000 ─────────────────────────────────────
-    print("Fusion: RRF → top-2000 shortlist...")
+    # ── Fusion: weighted score fusion → shortlist top-2000 ────────────────────
+    # Score-based fusion (not RRF) — see weighted_score_fusion() in scoring.py
+    # for why: RRF discards how confident each method was, only who ranked #1.
+    print("Fusion: weighted score fusion (BM25 + dense) → top-2000 shortlist...")
     t3 = time.time()
-    rrf_scores = rrf_fusion(bm25_ranked, dense_ranked)
-    top2000_ids = sorted(rrf_scores.keys(), key=lambda cid: -rrf_scores[cid])[:2000]
+    fusion_scores = weighted_score_fusion(bm25_raw, dense_scores, candidate_ids)
+    top2000_ids = sorted(fusion_scores.keys(), key=lambda cid: -fusion_scores[cid])[:2000]
     top2000_set = set(top2000_ids)
 
     df_top = df[df["candidate_id"].isin(top2000_set)].copy()
@@ -181,16 +197,20 @@ def rank_candidates(
     tqdm.pandas(desc="Availability")
     df_top["availability_score"] = df_top.progress_apply(row_availability, axis=1)
 
-    # Attach and normalise RRF scores
-    df_top["rrf_score"] = df_top["candidate_id"].map(rrf_scores)
-    max_rrf = df_top["rrf_score"].max()
-    df_top["rrf_score_norm"] = df_top["rrf_score"] / max_rrf if max_rrf > 0 else 0.0
+    # Attach and normalise fusion scores. weighted_score_fusion() already
+    # min-max normalizes each component globally (over all 100K candidates),
+    # so re-normalize here to the top-of-shortlist so the best candidate in
+    # this top-2000 gets the fusion term's full weight — consistent with how
+    # structural_score/availability_score are independently scaled to [0, 1].
+    df_top["fusion_score"] = df_top["candidate_id"].map(fusion_scores)
+    max_fusion = df_top["fusion_score"].max()
+    df_top["fusion_score_norm"] = df_top["fusion_score"] / max_fusion if max_fusion > 0 else 0.0
 
     # Preliminary score (additive — Bug 1 fix: no multiplier, KDD docs match code)
     df_top["prelim_score"] = (
-        0.50 * df_top["rrf_score_norm"] +
-        0.35 * df_top["structural_score"] +
-        0.15 * df_top["availability_score"]
+        PRELIM_FUSION_WEIGHT * df_top["fusion_score_norm"] +
+        PRELIM_STRUCTURAL_WEIGHT * df_top["structural_score"] +
+        PRELIM_AVAILABILITY_WEIGHT * df_top["availability_score"]
     )
 
     # Hard disqualifiers: zero out before cross-encoder stage
@@ -200,20 +220,34 @@ def rank_candidates(
     print(f"  Structural scoring done in {time.time() - t4:.1f}s. Prelim top candidate: "
           f"{df_top.nlargest(1, 'prelim_score')['candidate_id'].iloc[0]}")
 
-    # ── Stage 4: Cross-encoder reranker on top-300 ────────────────────────────
-    # Reduced from top-500 to top-300 to keep Stage 4 under ~90s on constrained CPU.
-    # NDCG@10 impact is negligible — the top 100 are well within the top 300 after
-    # structural scoring, and the CE is most valuable in the top 10–50 range anyway.
-    print("Stage 4: Cross-encoder reranking (top-300)...")
+    # ── Stage 4: Cross-encoder reranker on top-N ──────────────────────────────
+    # ce_topn widened back to 500 (was reduced to 300 purely for time budget,
+    # not because 300 was structurally correct) now that the keyword/date bugs
+    # fixed elsewhere freed up time. Two accuracy-neutral speedups make room
+    # for the extra candidates instead of just eating the added time — see
+    # module docstring for the full rationale.
+    print(f"Stage 4: Cross-encoder reranking (top-{ce_topn})...")
     t5 = time.time()
-    top300 = df_top.nlargest(300, "prelim_score").copy()
-    top300_ids = top300["candidate_id"].tolist()
+    topN = df_top.nlargest(ce_topn, "prelim_score").copy()
+    topN_ids = topN["candidate_id"].tolist()
 
     cid_to_text = dict(zip(candidate_ids, candidate_texts))
-    pairs = [(jd_query_text, cid_to_text[cid]) for cid in top300_ids]
+    topN_texts = [cid_to_text[cid] for cid in topN_ids]
+
+    # Speedup 1: sort pairs by text length before batching, predict, then
+    # restore original order. batch_size pads every item in a batch to that
+    # batch's longest item — grouping similar lengths cuts wasted padding
+    # compute without changing any individual prediction.
+    order = np.argsort([len(t) for t in topN_texts])
+    pairs_sorted = [(jd_query_text, topN_texts[i]) for i in order]
 
     cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
-    ce_scores = cross_encoder.predict(pairs, batch_size=16, show_progress_bar=True)
+    # Speedup 2: batch_size 16 -> 32. Re-benchmark on your hardware — CPU
+    # batching gains are less predictable than on GPU; revert if it's slower.
+    ce_scores_sorted = cross_encoder.predict(pairs_sorted, batch_size=32, show_progress_bar=True)
+
+    ce_scores = np.empty(len(topN_ids), dtype=np.float64)
+    ce_scores[order] = ce_scores_sorted
 
     # Normalise CE scores to [0, 1]
     ce_min, ce_max = ce_scores.min(), ce_scores.max()
@@ -222,26 +256,31 @@ def rank_candidates(
     else:
         ce_scores_norm = np.ones_like(ce_scores) * 0.5
 
-    top300 = top300.copy()
-    top300["ce_score"] = ce_scores_norm
+    topN["ce_score"] = ce_scores_norm
 
-    # Blend preliminary (structural context) with cross-encoder (relevance precision)
-    top300["final_score"] = (
-        0.40 * top300["prelim_score"] +
-        0.60 * top300["ce_score"]
+    # Blend preliminary (structural context) with cross-encoder (relevance
+    # precision). CE's weight was raised (was 0.40/0.60) — it's the one stage
+    # with real contextual judgment (full cross-attention over JD + candidate
+    # text), vs. prelim_score which is still partly keyword/rule-driven.
+    topN["final_score"] = (
+        FINAL_PRELIM_WEIGHT * topN["prelim_score"] +
+        FINAL_CE_WEIGHT * topN["ce_score"]
     )
 
     # Re-enforce hard disqualifiers (CE might score disqualified candidates highly)
-    top300.loc[top300["is_honeypot"],               "final_score"] = 0.0
-    top300.loc[top300["entire_career_it_services"],  "final_score"] = 0.0
+    topN.loc[topN["is_honeypot"],               "final_score"] = 0.0
+    topN.loc[topN["entire_career_it_services"],  "final_score"] = 0.0
 
     # Final top-100: sort by final_score desc, candidate_id asc (deterministic tiebreak)
-    top100 = top300.nlargest(100, "final_score").copy()
+    top100 = topN.nlargest(100, "final_score").copy()
     top100 = top100.sort_values(["final_score", "candidate_id"], ascending=[False, True])
     top100["rank"] = range(1, 101)
     top100["score"] = top100["final_score"].round(6)
 
-    print(f"  Cross-encoder done in {time.time() - t5:.1f}s. Top candidate: {top100.iloc[0]['candidate_id']}")
+    elapsed_ce = time.time() - t5
+    print(f"  Cross-encoder done in {elapsed_ce:.1f}s "
+          f"({elapsed_ce / max(1, len(topN_ids)):.3f}s/candidate). "
+          f"Top candidate: {top100.iloc[0]['candidate_id']}")
     print(f"  Total ranking time: {time.time() - t1:.1f}s")
     return top100
 
@@ -295,6 +334,11 @@ def main():
     parser.add_argument("--out", default="submission.csv", help="Output CSV path")
     parser.add_argument("--no-reasoning", action="store_true",
                         help="Skip reasoning (writes top100_ids.txt for Script 04)")
+    parser.add_argument("--ce-topn", type=int, default=500,
+                        help="How many candidates (by prelim_score) the cross-encoder "
+                             "reranks in Stage 4. Dial this down (e.g. 400/350) if your "
+                             "hardware can't fit 500 in the 5-minute budget — no code "
+                             "changes needed.")
     args = parser.parse_args()
 
     print("Loading pre-computed data...")
@@ -302,7 +346,8 @@ def main():
     print(f"  {len(candidate_ids)} candidates loaded. Embeddings shape: {embeddings.shape}")
 
     print("\nRanking candidates...")
-    top100 = rank_candidates(df, candidate_ids, embeddings, jd_embedding, candidate_texts)
+    top100 = rank_candidates(df, candidate_ids, embeddings, jd_embedding, candidate_texts,
+                              ce_topn=args.ce_topn)
 
     print("\nAttaching reasoning...")
     top100 = attach_reasoning(top100, args.precomputed, args.no_reasoning)

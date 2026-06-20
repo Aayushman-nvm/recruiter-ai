@@ -9,9 +9,17 @@ No other file should redefine these formulas.
 
 from datetime import date
 
+import numpy as np
+
 # ── Reference date ──────────────────────────────────────────────────────────
 # Fixed reference point for all date-relative computations (last_active_days_ago, etc.)
-REFERENCE_DATE = date(2025, 6, 1)
+# NOTE: this MUST be >= the latest last_active_date in the dataset, or every
+# last_active_days_ago comes out negative and silently maxes out the recency
+# sub-score for the entire population (verified: with the old 2025-06-01 value,
+# all 100,000 rows in features.parquet had last_active_days_ago < 0, since the
+# dataset's last_active_date actually ranges 2025-09-29 -> 2026-05-27).
+# Bump this if you regenerate the dataset with a later snapshot date.
+REFERENCE_DATE = date(2026, 5, 28)
 
 # ── Target cities ───────────────────────────────────────────────────────────
 # All India cities explicitly mentioned in the JD or implied by proximity to Noida.
@@ -117,9 +125,12 @@ def compute_company_fit(
         ml_recency = 0.20
 
     if has_product_company_exp and has_ml_production_experience:
-        # Guard: sentinel 99.0 means "never did ML" — treat as no ML experience
+        # Defensive fallback only — under the current extraction logic,
+        # has_ml_production_experience=True always pairs with a real
+        # (non-sentinel) years_since_last_ml_role, so this branch shouldn't
+        # actually fire. Kept in case extraction logic changes upstream.
         if years_since_last_ml_role >= 99.0:
-            return 0.65   # product, no ML (sentinel case)
+            return 0.65
         # Floor at 0.65 — stale ML always beats no-ML-at-all (Bug 2 fix)
         return max(0.65, 1.0 * ml_recency)
     elif has_product_company_exp:
@@ -295,27 +306,27 @@ def generate_reasoning(row: dict) -> str:
     entire_it         = bool(row.get("entire_career_it_services", False))
     has_product       = bool(row.get("has_product_company_exp", False))
     has_ml            = bool(row.get("has_ml_production_experience", False))
-    yrs_since_ml      = float(row.get("years_since_last_ml_role", 99) or 99)
-    traj_score        = float(row.get("trajectory_score", 0) or 0)
-    avg_tenure        = float(row.get("avg_tenure_months", 0) or 0)
+    yrs_since_ml      = float(row.get("years_since_last_ml_role") if row.get("years_since_last_ml_role") is not None else 99)
+    traj_score        = float(row.get("trajectory_score") if row.get("trajectory_score") is not None else 0)
+    avg_tenure        = float(row.get("avg_tenure_months") if row.get("avg_tenure_months") is not None else 0)
     trajectory_up     = bool(row.get("trajectory_upward", False))
 
-    sal_min           = float(row.get("salary_min_lpa", 0) or 0)
-    sal_max           = float(row.get("salary_max_lpa", 999) or 999)
+    sal_min           = float(row.get("salary_min_lpa") if row.get("salary_min_lpa") is not None else 0)
+    sal_max           = float(row.get("salary_max_lpa") if row.get("salary_max_lpa") is not None else 999)
     open_to_work      = bool(row.get("open_to_work_flag", False))
-    days_ago          = int(row.get("last_active_days_ago", 999) or 999)
-    response_rate     = float(row.get("recruiter_response_rate", 0) or 0)
-    notice_days       = int(row.get("notice_period_days", 90) or 90)
-    resp_time_hrs     = float(row.get("avg_response_time_hours", -1) or -1)
-    saves             = int(row.get("saved_by_recruiters_30d", 0) or 0)
-    skill_bonus       = float(row.get("skill_assessment_bonus", 0) or 0)
+    days_ago          = int(row.get("last_active_days_ago") if row.get("last_active_days_ago") is not None else 999)
+    response_rate     = float(row.get("recruiter_response_rate") if row.get("recruiter_response_rate") is not None else 0)
+    notice_days       = int(row.get("notice_period_days") if row.get("notice_period_days") is not None else 90)
+    resp_time_hrs     = float(row.get("avg_response_time_hours") if row.get("avg_response_time_hours") is not None else -1)
+    saves             = int(row.get("saved_by_recruiters_30d") if row.get("saved_by_recruiters_30d") is not None else 0)
+    skill_bonus       = float(row.get("skill_assessment_bonus") if row.get("skill_assessment_bonus") is not None else 0)
     edu_tier          = str(row.get("edu_tier", "unknown") or "unknown")
 
-    structural   = float(row.get("structural_score", 0) or 0)
-    availability = float(row.get("availability_score", 0) or 0)
-    ce_score     = float(row.get("ce_score", 0) or 0)
-    final_score  = float(row.get("final_score", 0) or 0)
-    rank         = int(row.get("rank", 0) or 0)
+    structural   = float(row.get("structural_score") if row.get("structural_score") is not None else 0)
+    availability = float(row.get("availability_score") if row.get("availability_score") is not None else 0)
+    ce_score     = float(row.get("ce_score") if row.get("ce_score") is not None else 0)
+    final_score  = float(row.get("final_score") if row.get("final_score") is not None else 0)
+    rank         = int(row.get("rank") if row.get("rank") is not None else 0)
 
     # ── Shorthands ────────────────────────────────────────────────────────────
     yoe_str     = f"{yoe:.1f}"
@@ -483,3 +494,96 @@ def compute_structural_score(
         0.08 * salary_fit
     )
     return min(1.0, raw + skill_assessment_bonus + edu_bonus)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Retrieval fusion + pipeline blend weights — single source of truth.
+#
+# rank.py and 04_eval.py both implement this same multi-stage blend
+# (retrieval fusion -> +structural -> +availability -> +cross-encoder), and
+# previously each hardcoded its own copy of every weight. That's the same
+# class of drift risk as the ML_KEYWORDS/seniority duplication fixed earlier
+# in this pass — so all of it now lives here once.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Fusion of BM25 (keyword) + dense (semantic) retrieval.
+# Weighted toward dense deliberately: the JD explicitly calls out keyword-
+# stuffing as a trap (jd.txt's closing note), so a confident semantic match
+# should be able to outscore a borderline keyword match, not just tie with it.
+FUSION_BM25_WEIGHT  = 0.35
+FUSION_DENSE_WEIGHT = 0.65
+
+# prelim_score = fusion + structural + availability (pre-cross-encoder).
+# Structural's weight was dropped slightly (was 0.35) now that the dense
+# fusion signal is actually allowed to differentiate (see weighted_score_fusion
+# below) and now that has_ml_production_experience's keyword false-positive
+# bug is fixed — structural no longer needs to carry as much of the load.
+PRELIM_FUSION_WEIGHT       = 0.55
+PRELIM_STRUCTURAL_WEIGHT   = 0.25
+PRELIM_AVAILABILITY_WEIGHT = 0.20
+
+# final_score = prelim_score + cross-encoder. CE gets more say than before
+# (was 0.60) since it's the one stage with real contextual/semantic judgment
+# (full cross-attention over JD + candidate text), vs. prelim_score which is
+# still partly keyword/rule-driven.
+FINAL_PRELIM_WEIGHT = 0.30
+FINAL_CE_WEIGHT     = 0.70
+
+assert abs(FUSION_BM25_WEIGHT + FUSION_DENSE_WEIGHT - 1.0) < 1e-9
+assert abs(PRELIM_FUSION_WEIGHT + PRELIM_STRUCTURAL_WEIGHT + PRELIM_AVAILABILITY_WEIGHT - 1.0) < 1e-9
+assert abs(FINAL_PRELIM_WEIGHT + FINAL_CE_WEIGHT - 1.0) < 1e-9
+
+
+def weighted_score_fusion(
+    bm25_scores: np.ndarray,
+    dense_scores: np.ndarray,
+    candidate_ids: list,
+    bm25_weight: float = FUSION_BM25_WEIGHT,
+    dense_weight: float = FUSION_DENSE_WEIGHT,
+) -> dict:
+    """
+    Score-based fusion of BM25 and dense retrieval — replaces Reciprocal Rank
+    Fusion (RRF).
+
+    RRF converts both rankings to rank *positions* before combining
+    (1/(k+rank+1) per list), which throws away how strong a match actually was.
+    A candidate with dense cosine 0.95 and one with cosine 0.32 get identical
+    credit if they're both rank #1 in their own list — RRF has no notion of
+    "confident match" vs "barely squeaked into first place". That's a real
+    problem here specifically because the JD's whole point is that keyword
+    overlap is an unreliable signal (see jd.txt's closing note to participants)
+    — RRF structurally can't let a strong semantic match win over a weak
+    keyword match; it can only let them tie.
+
+    This function instead min-max normalizes each raw score distribution to
+    [0, 1] and takes a weighted sum, so *how confident* each method was
+    directly affects the fused score, not just *whether* it ranked first.
+
+    bm25_scores / dense_scores must be aligned with candidate_ids by position
+    (i.e. bm25_scores[i] and dense_scores[i] both refer to candidate_ids[i]).
+    """
+    bm25_arr  = np.asarray(bm25_scores, dtype=np.float64)
+    dense_arr = np.asarray(dense_scores, dtype=np.float64)
+
+    def _minmax(x: np.ndarray) -> np.ndarray:
+        lo, hi = x.min(), x.max()
+        if hi - lo < 1e-12:
+            return np.zeros_like(x)
+        return (x - lo) / (hi - lo)
+
+    fused = bm25_weight * _minmax(bm25_arr) + dense_weight * _minmax(dense_arr)
+    return dict(zip(candidate_ids, fused.tolist()))
+
+
+def rrf_fusion(rank_list_a: list, rank_list_b: list, k: int = 60) -> dict:
+    """
+    Reciprocal Rank Fusion — kept for backward compatibility (e.g. sandbox/app.py
+    or any other consumer that may still call it). New code should prefer
+    weighted_score_fusion() above; see its docstring for why.
+    """
+    scores = {}
+    for rank, cid in enumerate(rank_list_a):
+        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank + 1)
+    for rank, cid in enumerate(rank_list_b):
+        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank + 1)
+    return scores
