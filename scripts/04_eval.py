@@ -22,18 +22,24 @@ STEP 2 — Run this script from the project root:
 
 Configurations tested:
   A. BM25 only                           (keyword baseline)
-  B. Dense (bge-base) only               (semantic baseline)
-  C. BM25 + Dense (RRF)                  (hybrid retrieval)
+  B. Dense (all-MiniLM-L6-v2) only       (semantic baseline — same model as production)
+  C. BM25 + Dense (weighted fusion)      (hybrid retrieval)
   D. C + structural features             (+ company/location/ML signals)
   E. D + availability (additive)         (+ reachability signals)
   F. E + cross-encoder reranker          (full pipeline — expected best)
 
 The NDCG@10 numbers from Config A vs F show how much lift the full pipeline
 gives over naive keyword matching. This is what goes in the README.
+
+NOTE: Config B-F MUST use the same dense embedding model as production
+(all-MiniLM-L6-v2). An earlier version of this script used BAAI/bge-base-en-v1.5
+instead — a different, heavier model your deployed pipeline never actually runs —
+so the ablation table was measuring a system you don't ship. Fixed.
 """
 
 import json
 import os
+import re
 import sys
 from datetime import date
 from pathlib import Path
@@ -47,7 +53,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from scoring import (
+    FINAL_CE_WEIGHT,
+    FINAL_PRELIM_WEIGHT,
     IT_SERVICES_COMPANIES,
+    PRELIM_AVAILABILITY_WEIGHT,
+    PRELIM_FUSION_WEIGHT,
+    PRELIM_STRUCTURAL_WEIGHT,
     REFERENCE_DATE,
     TARGET_CITIES,
     compute_availability_score,
@@ -58,6 +69,7 @@ from scoring import (
     compute_salary_fit,
     compute_skill_assessment_bonus,
     compute_structural_score,
+    weighted_score_fusion,
 )
 from utils import build_candidate_text
 
@@ -67,7 +79,9 @@ LABELS_PATH   = ROOT / "eval" / "manual_labels.json"
 OUT_PATH      = ROOT / "eval" / "eval_results.json"
 JD_QUERY_PATH = ROOT / "jd_query.txt"
 
-BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
+# NOTE: production uses all-MiniLM-L6-v2, which (unlike BGE) doesn't need a
+# query-side instruction prefix, so there is none here.
+DENSE_MODEL_NAME = "all-MiniLM-L6-v2"
 
 # Same ML_KEYWORDS as 01_extract_features.py — must stay in sync
 ML_KEYWORDS = [
@@ -77,8 +91,20 @@ ML_KEYWORDS = [
     "bert", "transformer", "nlp", "information retrieval", "learning to rank",
     "xgboost ranking", "neural ranker", "reranker", "dense retrieval",
     "search engine", "knowledge graph", "question answering", "vector database",
-    "approximate nearest neighbor", "ann", "hnsw", "cosine similarity",
+    "approximate nearest neighbor", "hnsw", "cosine similarity",
 ]
+# Dropped bare "ann" + switched to leading-word-boundary matching — see
+# 01_extract_features.py for the full rationale (the old `kw in desc` substring
+# check matched "llm" inside "fulfillment", "bert" inside "Robert", "ann" inside
+# "channel"/"planning", inflating has_ml_production_experience on ~52% of
+# completely unrelated titles in the real dataset).
+ML_KEYWORD_PATTERN = re.compile(
+    r"\b(?:" + "|".join(re.escape(kw) for kw in ML_KEYWORDS) + r")"
+)
+
+
+def _has_ml_keyword(desc: str) -> bool:
+    return ML_KEYWORD_PATTERN.search(desc) is not None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -164,7 +190,7 @@ def extract_features_inline(c: dict) -> dict:
 
     for role in career:
         desc = (role.get("description") or "").lower()
-        if any(kw in desc for kw in ML_KEYWORDS):
+        if _has_ml_keyword(desc):
             has_ml = True
             end_raw = role.get("end_date")
             end     = _parse_date(end_raw) if end_raw else REFERENCE_DATE
@@ -190,13 +216,19 @@ def extract_features_inline(c: dict) -> dict:
 
     SENIORITY_HIGH   = {"principal","staff engineer","head of","vp","director","distinguished","fellow","chief"}
     SENIORITY_SENIOR = {"senior","lead","tech lead","sr.","sr ","staff"}
+    SENIORITY_MID    = {"mid-level","engineer ii","sde ii","swe ii"}
     SENIORITY_JUNIOR = {"junior","associate","entry","fresher","intern","trainee"}
 
     def _seniority(title: str) -> int:
+        # Was missing the SENIORITY_MID branch present in 01_extract_features.py's
+        # get_title_seniority() — silently drifted despite the "must stay in sync"
+        # comment on this file. Mid-level titles fell through to the default (3)
+        # instead of (2).
         t = (title or "").lower()
         if any(k in t for k in SENIORITY_HIGH):   return 5
         if any(k in t for k in SENIORITY_SENIOR): return 4
         if any(k in t for k in SENIORITY_JUNIOR): return 1
+        if any(k in t for k in SENIORITY_MID):    return 2
         return 3
 
     tit_now   = _seniority(p.get("current_title", ""))
@@ -276,15 +308,6 @@ def score_availability(feat: dict) -> float:
     )
 
 
-def rrf_fusion(rank_a: list, rank_b: list, k: int = 60) -> dict:
-    scores: dict = {}
-    for rank, cid in enumerate(rank_a):
-        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank + 1)
-    for rank, cid in enumerate(rank_b):
-        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank + 1)
-    return scores
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -328,49 +351,70 @@ def main():
     bm25_retriever.index(corpus_tokens, show_progress=False)
 
     query_tokens = bm25s.tokenize(jd_query_text, stopwords=None, show_progress=False)
-    bm25_indices, _ = bm25_retriever.retrieve(query_tokens, k=len(cids), show_progress=False)
-    bm25_ranked     = [cids[i] for i in bm25_indices[0]]
+    # Capture raw scores too (not just ranked order) — needed for Config C's
+    # weighted_score_fusion below. retrieve() returns indices/scores in
+    # descending-score order; scatter back into cids-aligned position.
+    bm25_indices, bm25_scores_sorted = bm25_retriever.retrieve(
+        query_tokens, k=len(cids), show_progress=False
+    )
+    bm25_ranked = [cids[i] for i in bm25_indices[0]]
+    bm25_raw    = np.empty(len(cids), dtype=np.float64)
+    bm25_raw[bm25_indices[0]] = bm25_scores_sorted[0]
     ndcg_a = ndcg_at_k([labels.get(cid, 0) for cid in bm25_ranked])
 
-    # ── Config B: Dense (bge-base) only ──────────────────────────────────────
-    print("Config B: Dense (bge-base) only...")
-    encoder       = SentenceTransformer("BAAI/bge-base-en-v1.5")
+    # ── Config B: Dense (all-MiniLM-L6-v2) only ──────────────────────────────
+    print("Config B: Dense (all-MiniLM-L6-v2) only...")
+    encoder       = SentenceTransformer(DENSE_MODEL_NAME)
     cand_embs     = encoder.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
-    jd_emb        = encoder.encode(BGE_QUERY_INSTRUCTION + jd_query_text,
+    jd_emb        = encoder.encode(jd_query_text,
                                    normalize_embeddings=True, convert_to_numpy=True)
     dense_raw     = cand_embs @ jd_emb
     dense_ranked  = sorted(cids, key=lambda cid: -float(dense_raw[cids.index(cid)]))
     ndcg_b = ndcg_at_k([labels.get(cid, 0) for cid in dense_ranked])
 
-    # ── Config C: BM25 + Dense (RRF) ─────────────────────────────────────────
-    print("Config C: BM25 + Dense (RRF)...")
-    rrf           = rrf_fusion(bm25_ranked, dense_ranked)
-    rrf_ranked    = sorted(cids, key=lambda cid: -rrf.get(cid, 0.0))
-    ndcg_c        = ndcg_at_k([labels.get(cid, 0) for cid in rrf_ranked])
+    # ── Config C: BM25 + Dense (weighted score fusion) ───────────────────────
+    # Was RRF — switched to match rank.py's production fusion (see
+    # weighted_score_fusion()'s docstring in scoring.py for why RRF was
+    # dropped). Eval must mirror production or the ablation table measures a
+    # system you don't ship — same principle as the embedding-model fix.
+    print("Config C: BM25 + Dense (weighted score fusion)...")
+    fusion        = weighted_score_fusion(bm25_raw, dense_raw, cids)
+    fusion_ranked = sorted(cids, key=lambda cid: -fusion.get(cid, 0.0))
+    ndcg_c        = ndcg_at_k([labels.get(cid, 0) for cid in fusion_ranked])
 
     # ── Config D: C + structural ──────────────────────────────────────────────
-    print("Config D: RRF + structural features...")
-    max_rrf   = max(rrf.values()) if rrf else 1.0
-    rrf_norm  = {cid: v / max_rrf for cid, v in rrf.items()}
+    print("Config D: fusion + structural features...")
+    max_fusion = max(fusion.values()) if fusion else 1.0
+    fusion_norm = {cid: v / max_fusion if max_fusion > 0 else 0.0 for cid, v in fusion.items()}
+
+    # No availability term yet at this ablation step — renormalize fusion vs.
+    # structural to the SAME relative proportion production uses between them
+    # (PRELIM_FUSION_WEIGHT : PRELIM_STRUCTURAL_WEIGHT), rather than an
+    # arbitrary independent split. (Previously this used a hardcoded 0.65/0.35
+    # that didn't match Config E's 0.50/0.35 ratio — inconsistent on its own.)
+    _d_total = PRELIM_FUSION_WEIGHT + PRELIM_STRUCTURAL_WEIGHT
+    _d_fusion_w, _d_structural_w = PRELIM_FUSION_WEIGHT / _d_total, PRELIM_STRUCTURAL_WEIGHT / _d_total
 
     def config_d_score(cid: str) -> float:
-        return 0.65 * rrf_norm.get(cid, 0.0) + 0.35 * score_structural(feat_map[cid])
+        return _d_fusion_w * fusion_norm.get(cid, 0.0) + _d_structural_w * score_structural(feat_map[cid])
 
     config_d_ranked = sorted(cids, key=lambda cid: -config_d_score(cid))
     ndcg_d = ndcg_at_k([labels.get(cid, 0) for cid in config_d_ranked])
 
     # ── Config E: D + availability ────────────────────────────────────────────
-    print("Config E: RRF + structural + availability...")
+    # This is rank.py's actual prelim_score formula — same centralized weights.
+    print("Config E: fusion + structural + availability (= prelim_score)...")
 
     def config_e_score(cid: str) -> float:
-        return (0.50 * rrf_norm.get(cid, 0.0)
-                + 0.35 * score_structural(feat_map[cid])
-                + 0.15 * score_availability(feat_map[cid]))
+        return (PRELIM_FUSION_WEIGHT * fusion_norm.get(cid, 0.0)
+                + PRELIM_STRUCTURAL_WEIGHT * score_structural(feat_map[cid])
+                + PRELIM_AVAILABILITY_WEIGHT * score_availability(feat_map[cid]))
 
     config_e_ranked = sorted(cids, key=lambda cid: -config_e_score(cid))
     ndcg_e = ndcg_at_k([labels.get(cid, 0) for cid in config_e_ranked])
 
     # ── Config F: E + cross-encoder ──────────────────────────────────────────
+    # This is rank.py's actual final_score formula — same centralized weights.
     print("Config F: Full pipeline + cross-encoder (~30–60s)...")
     prelim_scores = {cid: config_e_score(cid) for cid in cids}
     # On 50 candidates, run CE on the top 20 (those candidates are all we have)
@@ -378,19 +422,23 @@ def main():
     top_ids = sorted(cids, key=lambda cid: -prelim_scores[cid])[:top_n]
     cid_to_text = dict(zip(cids, texts))
 
-    ce_model  = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-    pairs     = [(jd_query_text, cid_to_text[cid]) for cid in top_ids]
-    ce_scores = ce_model.predict(pairs, batch_size=16)
+    # Must match rank.py's CROSS_ENCODER_MODEL constant — currently both are
+    # "cross-encoder/ms-marco-MiniLM-L-6-v2", but this is a second hardcoded
+    # copy, same drift risk as the ML_KEYWORDS/seniority duplication above.
+    ce_model    = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    top_texts   = [cid_to_text[cid] for cid in top_ids]
+    pairs       = [(jd_query_text, t) for t in top_texts]
+    ce_scores   = ce_model.predict(pairs, batch_size=32)
     ce_min, ce_max = ce_scores.min(), ce_scores.max()
     ce_norm = (ce_scores - ce_min) / (ce_max - ce_min + 1e-9)
 
     final_scores: dict = {}
     for i, cid in enumerate(top_ids):
-        final_scores[cid] = 0.40 * prelim_scores[cid] + 0.60 * float(ce_norm[i])
+        final_scores[cid] = FINAL_PRELIM_WEIGHT * prelim_scores[cid] + FINAL_CE_WEIGHT * float(ce_norm[i])
     # Candidates outside top_n get a deflated prelim score (CE not run on them)
     for cid in cids:
         if cid not in final_scores:
-            final_scores[cid] = prelim_scores[cid] * 0.40
+            final_scores[cid] = prelim_scores[cid] * FINAL_PRELIM_WEIGHT
 
     config_f_ranked = sorted(cids, key=lambda cid: -final_scores[cid])
     ndcg_f = ndcg_at_k([labels.get(cid, 0) for cid in config_f_ranked])
@@ -398,8 +446,8 @@ def main():
     # ── Print ablation table ──────────────────────────────────────────────────
     results = {
         "A": {"description": "BM25 only",                 "ndcg_at_10": round(ndcg_a, 4)},
-        "B": {"description": "Dense (bge-base) only",      "ndcg_at_10": round(ndcg_b, 4)},
-        "C": {"description": "BM25 + Dense (RRF)",         "ndcg_at_10": round(ndcg_c, 4)},
+        "B": {"description": "Dense (all-MiniLM-L6-v2) only", "ndcg_at_10": round(ndcg_b, 4)},
+        "C": {"description": "BM25 + Dense (weighted fusion)", "ndcg_at_10": round(ndcg_c, 4)},
         "D": {"description": "C + structural features",    "ndcg_at_10": round(ndcg_d, 4)},
         "E": {"description": "D + availability",           "ndcg_at_10": round(ndcg_e, 4)},
         "F": {"description": "E + cross-encoder reranker", "ndcg_at_10": round(ndcg_f, 4)},
