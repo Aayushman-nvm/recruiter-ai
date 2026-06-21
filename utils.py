@@ -7,6 +7,24 @@ Imported by:
 
 Keeping this in one place eliminates the risk of the two scripts diverging
 in how they represent candidates, which would corrupt any comparison.
+
+Reviewed against jd.txt's closing "keyword trap" warning (a candidate with
+every AI keyword in their skills list but a "Marketing Manager" title is not
+a fit) and Scoring_plan.md: deliberately left build_candidate_text()'s
+behavior unchanged here rather than capping/de-weighting the skills list.
+Two reasons:
+  1. The actual disqualification mechanism for that trap lives downstream in
+     the structural layer, not in the embedding text — has_ml_production_experience
+     is derived from career_history *descriptions*, not the skills list, and
+     is_honeypot explicitly flags implausible skill claims (expert proficiency
+     with 0 duration, expert-duration totals exceeding plausible YoE). Dense/
+     BM25 retrieval is a recall stage (top-2000 shortlist); precision against
+     this exact trap is enforced later, by design.
+  2. Changing this function changes the text fed into the embedding model,
+     which would silently invalidate any already-computed
+     precomputed/candidate_embeddings.npy. If you do change this function,
+     re-run scripts/02_embed_candidates.py before the next scripts/rank.py
+     run, or fusion/cross-encoder scores will be computed against stale text.
 """
 
 
