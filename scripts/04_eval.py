@@ -66,6 +66,7 @@ from scoring import (
     compute_education_bonus,
     compute_experience_fit,
     compute_location_fit,
+    compute_location_multiplier,
     compute_salary_fit,
     compute_skill_assessment_bonus,
     compute_structural_score,
@@ -275,6 +276,11 @@ def extract_features_inline(c: dict) -> dict:
         "saved_by_recruiters_30d":      int(sig.get("saved_by_recruiters_30d", 0) or 0),
         "verified_email":               bool(sig.get("verified_email", False)),
         "verified_phone":               bool(sig.get("verified_phone", False)),
+        "interview_completion_rate":    float(sig.get("interview_completion_rate", 0.0) or 0.0),
+        "offer_acceptance_rate":        float(sig.get("offer_acceptance_rate")
+                                              if sig.get("offer_acceptance_rate") is not None else -1),
+        "github_activity_score":        float(sig.get("github_activity_score")
+                                              if sig.get("github_activity_score") is not None else -1),
         "is_honeypot":                  False,
     }
 
@@ -305,6 +311,8 @@ def score_availability(feat: dict) -> float:
         feat["recruiter_response_rate"], feat["avg_response_time_hours"],
         feat["notice_period_days"],  feat["saved_by_recruiters_30d"],
         feat["verified_email"],      feat["verified_phone"],
+        feat["interview_completion_rate"], feat["offer_acceptance_rate"],
+        feat["github_activity_score"],
     )
 
 
@@ -439,6 +447,16 @@ def main():
     for cid in cids:
         if cid not in final_scores:
             final_scores[cid] = prelim_scores[cid] * FINAL_PRELIM_WEIGHT
+
+    # Same location/relocation multiplier as rank.py's final_score — mirrors
+    # production exactly (Config E above intentionally does NOT include this,
+    # since it mirrors prelim_score, which is pre-multiplier in production too).
+    for cid in cids:
+        feat = feat_map[cid]
+        mult = compute_location_multiplier(
+            feat["is_india_based"], feat["is_target_city"], feat["willing_to_relocate"]
+        )
+        final_scores[cid] *= mult
 
     config_f_ranked = sorted(cids, key=lambda cid: -final_scores[cid])
     ndcg_f = ndcg_at_k([labels.get(cid, 0) for cid in config_f_ranked])
