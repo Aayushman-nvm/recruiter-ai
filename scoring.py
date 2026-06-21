@@ -7,6 +7,7 @@ All scoring constants and compute_*() functions live here.
 No other file should redefine these formulas.
 """
 
+import re
 from datetime import date
 
 import numpy as np
@@ -45,6 +46,121 @@ JD_RELEVANT_SKILLS = {
     "recommendation systems", "data science", "pytorch", "tensorflow",
 }
 
+# ── Primary office cities ────────────────────────────────────────────────────
+# jd.txt's actual offices ("Location: Pune/Noida, India") and the location
+# named in its own "ideal candidate" summary ("How to read between the lines":
+# "Located in or willing to relocate to Noida or Pune"). Distinct from
+# TARGET_CITIES below — the JD ranks Pune/Noida above the other welcomed
+# cities (Hyderabad, Mumbai, Delhi NCR, Bengaluru), it just doesn't rank those
+# against each other, so compute_location_fit() only needs two tiers.
+PRIMARY_CITIES = {"pune", "noida"}
+
+# ── Research-only / academic career detection ────────────────────────────────
+# Explicit hard disqualifier in jd.txt: "If you've spent your career in pure
+# research environments (academic labs, research-only roles) without any
+# production deployment — we will not move forward. We are explicit about
+# this." Mirrors IT_SERVICES_COMPANIES' role -- a company/title name heuristic,
+# checked per-role in 01_extract_features.py / 04_eval.py the same way IT
+# services employers are.
+#
+# Deliberately narrow: only unambiguous academic-institution / pure-research
+# names and titles. Does NOT include corporate research-lab names ("Google
+# Research", "Microsoft Research", "X Labs") -- jd.txt's own examples are
+# academic ("academic labs"), and those roles sit inside real product
+# companies that also ship production systems, so flagging them would create
+# false positives well beyond what the JD describes.
+RESEARCH_ONLY_COMPANY_INDICATORS = {
+    "university", "institute of technology", "iisc",
+    "indian institute of science", "research institute",
+    "academy of sciences", "college of engineering",
+}
+RESEARCH_ONLY_TITLE_INDICATORS = {
+    "phd", "postdoc", "post-doc", "doctoral researcher", "research fellow",
+    "research scientist", "research intern", "graduate researcher",
+}
+
+# ── Industry relevance for current_industry bonus ────────────────────────────
+# jd.txt nice-to-have: "Prior exposure to HR-tech, recruiting tech, or
+# marketplace products." Word/phrase choices avoid bare substrings that
+# collide with unrelated industries (e.g. no bare "search", which is a
+# substring of "Research").
+INDUSTRY_RELEVANT_KEYWORDS = {
+    "hr tech", "hrtech", "human resources", "recruit", "talent",
+    "staffing", "marketplace", "e-commerce", "ecommerce",
+    "search engine", "classifieds", "job board", "jobs platform",
+}
+
+# ── ML/IR production-experience keywords ─────────────────────────────────────
+# Single authoritative source for has_ml_production_experience detection.
+# Previously duplicated verbatim (with a "must stay in sync" comment) across
+# 01_extract_features.py and 04_eval.py -- a real drift already happened once
+# (04_eval.py's seniority mapping silently fell out of sync, see
+# get_title_seniority() below). Centralizing here removes that risk the same
+# way TARGET_CITIES/IT_SERVICES_COMPANIES already do for their callers.
+#
+# Dropped bare "ann" — confirmed root cause of has_ml_production_experience
+# being True on ~52% of completely unrelated titles (HR Manager, Accountant,
+# Civil Engineer, ...) in the real dataset. "ann" as a naive substring matched
+# inside "channel", "planning", "announce", etc. "approximate nearest
+# neighbor" and "hnsw" below already cover the legitimate case.
+#
+# "opensearch", "hybrid search", "hybrid retrieval" added — jd.txt and
+# jd_query.txt both name OpenSearch and hybrid retrieval explicitly as
+# required infra/technique, but the old list only had "elasticsearch" and
+# "dense retrieval", so a candidate whose description used the JD's own
+# vocabulary for hybrid search could be missed.
+ML_KEYWORDS = [
+    "embedding", "vector", "retrieval", "ranking", "recommendation",
+    "llm", "fine-tun", "rag", "semantic search", "sentence-transformer",
+    "faiss", "pinecone", "weaviate", "qdrant", "milvus", "elasticsearch",
+    "opensearch", "bert", "transformer", "nlp", "information retrieval",
+    "learning to rank", "xgboost ranking", "neural ranker", "reranker",
+    "dense retrieval", "hybrid search", "hybrid retrieval", "search engine",
+    "knowledge graph", "question answering", "vector database",
+    "approximate nearest neighbor", "hnsw", "cosine similarity",
+]
+# Matching requires a leading word boundary (re.search(r"\bKEYWORD", desc))
+# instead of plain `kw in desc`. A *leading* boundary (not a trailing one) was
+# chosen deliberately: stems like "fine-tun" and "sentence-transformer" are
+# meant to also match "fine-tuning"/"sentence-transformers", so they can't
+# require a boundary at the end. A leading boundary alone is enough to stop
+# "llm" matching inside "fulfillment" and "bert" matching inside
+# "Robert"/"Albert" (no boundary before "bert" there), while still matching
+# every legitimate case (a keyword preceded by whitespace, punctuation, or
+# string start).
+ML_KEYWORD_PATTERN = re.compile(
+    r"\b(?:" + "|".join(re.escape(kw) for kw in ML_KEYWORDS) + r")"
+)
+
+
+def has_ml_keyword(desc: str) -> bool:
+    """True if desc (a role description, any case) contains any ML/IR
+    production keyword. Used by 01_extract_features.py and 04_eval.py when
+    scanning career_history."""
+    return ML_KEYWORD_PATTERN.search((desc or "").lower()) is not None
+
+
+# ── Title seniority mapping ─────────────────────────────────────────────────
+# 5: principal/staff/head/vp/director  4: senior/lead  3: default  2: mid
+# 1: junior. Single authoritative source — see ML_KEYWORDS above for why
+# (04_eval.py's copy of this exact mapping had silently dropped the
+# SENIORITY_MID branch despite a "must stay in sync" comment).
+SENIORITY_HIGH   = {"principal", "staff engineer", "head of", "vp", "vice president",
+                    "director", "distinguished", "fellow", "chief"}
+SENIORITY_SENIOR = {"senior", "lead", "tech lead", "sr.", "sr ", "staff"}
+SENIORITY_MID    = {"mid-level", "engineer ii", "sde ii", "swe ii"}
+SENIORITY_JUNIOR = {"junior", "associate", "entry", "fresher", "intern", "trainee"}
+
+
+def get_title_seniority(title: str) -> int:
+    t = (title or "").lower()
+    if any(k in t for k in SENIORITY_HIGH):   return 5
+    if any(k in t for k in SENIORITY_SENIOR): return 4
+    if any(k in t for k in SENIORITY_JUNIOR): return 1
+    if any(k in t for k in SENIORITY_MID):    return 2
+    return 3
+
+
 # ── Estimated salary target range (INR LPA) ──────────────────────────────────
 # Senior AI Engineer, Series A India startup, 5–9 YoE, AI specialisation.
 # Wide range deliberately chosen to reduce false negatives from estimation error.
@@ -79,15 +195,27 @@ def compute_location_fit(
     is_india_based: bool,
     is_target_city: bool,
     willing_to_relocate: bool,
+    is_primary_city: bool = False,
 ) -> float:
     """
-    Score location fit. JD office is Noida; India-based strongly preferred.
-    Uses pre-computed boolean columns from features.parquet (Script 01).
+    Score location fit. JD offices are Noida and Pune; India-based strongly
+    preferred. Uses pre-computed boolean columns from features.parquet
+    (Script 01).
+
+    is_primary_city: Pune/Noida specifically (PRIMARY_CITIES). jd.txt names
+    these as its actual offices and as the location in its own "ideal
+    candidate" summary ("Located in or willing to relocate to Noida or
+    Pune"). The other JD-welcomed cities (is_target_city: Hyderabad, Mumbai,
+    Delhi NCR, Bengaluru, etc.) score slightly below that — not because the
+    JD ranks them against each other (it doesn't), but because it explicitly
+    ranks them below Pune/Noida.
     """
     if not is_india_based:
         return 0.15 if not willing_to_relocate else 0.45
-    if is_target_city:
+    if is_primary_city:
         return 1.0
+    elif is_target_city:
+        return 0.88
     elif willing_to_relocate:
         return 0.78
     else:
@@ -99,18 +227,39 @@ def compute_company_fit(
     has_product_company_exp: bool,
     has_ml_production_experience: bool,
     years_since_last_ml_role: float,
+    entire_career_research_only: bool = False,
+    shallow_recent_ml_only: bool = False,
 ) -> float:
     """
     Score company + ML production background.
 
-    Hard disqualifier: entire career in IT services (explicit in JD).
+    Hard disqualifiers:
+      - entire career in IT services (explicit in JD)
+      - entire career in pure research/academic roles with no production
+        deployment (explicit in JD: "we will not move forward. We are
+        explicit about this.") — previously NOT enforced here: prior to this
+        fix, has_product_company_exp only excluded IT-services employers, so
+        an all-academia candidate satisfied has_product_company_exp=True and
+        was scored as if they had real product-company experience. See
+        entire_career_research_only's definition in 01_extract_features.py
+        (mirrored in 04_eval.py) for the detection heuristic.
+
+    shallow_recent_ml_only: jd.txt — "If your 'AI experience' consists
+    primarily of recent (under 12 months) projects using LangChain to call
+    OpenAI — we will probably not move forward, unless you can demonstrate
+    substantial pre-LLM-era ML production experience." A candidate whose only
+    detected ML signal is a single recent (<=1yr) role under 12 months gets
+    this flag (see 01_extract_features.py) and is scored here as if they had
+    no ML production experience, rather than getting full credit for it.
 
     Bug 2 fix: stale ML always scores >= no ML ever.
     When ml_recency decays below 0.65, we floor at 0.65 (= product-no-ML baseline).
     This ensures "product + ML from 4 years ago" >= "product + zero ML experience".
     """
-    if entire_career_it_services:
+    if entire_career_it_services or entire_career_research_only:
         return 0.0   # hard disqualifier
+
+    effective_has_ml = has_ml_production_experience and not shallow_recent_ml_only
 
     # ML recency decay
     if years_since_last_ml_role <= 0:
@@ -124,7 +273,7 @@ def compute_company_fit(
     else:
         ml_recency = 0.20
 
-    if has_product_company_exp and has_ml_production_experience:
+    if has_product_company_exp and effective_has_ml:
         # Defensive fallback only — under the current extraction logic,
         # has_ml_production_experience=True always pairs with a real
         # (non-sentinel) years_since_last_ml_role, so this branch shouldn't
@@ -199,6 +348,48 @@ def compute_education_bonus(edu_tier: str, field_of_study: str) -> float:
     return 0.0   # unknown tier → neutral
 
 
+def compute_industry_bonus(current_industry: str) -> float:
+    """
+    Small tiebreaker for industry background relevant to the role.
+
+    jd.txt lists "Prior exposure to HR-tech, recruiting tech, or marketplace
+    products" under "Things we'd like you to have but won't reject you for" —
+    a nice-to-have, not a gate. Scoring_plan's Tier 2 #10 frames
+    current_industry the same way. Kept small and purely additive: absence of
+    this background is never penalized, only a match is rewarded.
+    """
+    industry = (current_industry or "").lower()
+    if any(kw in industry for kw in INDUSTRY_RELEVANT_KEYWORDS):
+        return 0.02
+    return 0.0
+
+
+def compute_github_bonus(github_activity_score) -> float:
+    """
+    Small tiebreaker for public/open-source engineering activity.
+
+    jd.txt nice-to-have: "Open-source contributions in the AI/ML space."
+    jd.txt negative signal: "People whose work has been entirely on
+    closed-source proprietary systems for 5+ years without external
+    validation (papers, talks, open-source)." github_activity_score is the
+    only proxy available in redrob_signals for either of these — there's no
+    papers/talks field to draw on.
+
+    Assumes github_activity_score is pre-normalized to [0, 1], like the other
+    redrob_signals rates (recruiter_response_rate, offer_acceptance_rate). If
+    the raw field turns out to use a different scale, rescale at the call
+    site before passing it in here.
+
+    -1 sentinel (no GitHub data) -> 0.0: most legitimate engineers don't have
+    public activity tied to their profile, so absence isn't itself negative —
+    only presence is rewarded.
+    """
+    score = float(github_activity_score) if github_activity_score is not None else -1.0
+    if score < 0:
+        return 0.0
+    return round(0.03 * max(0.0, min(1.0, score)), 4)
+
+
 def compute_availability_score(
     open_to_work: bool,
     last_active_days_ago: int,
@@ -208,26 +399,26 @@ def compute_availability_score(
     saved_by_recruiters_30d: int,
     verified_email: bool,
     verified_phone: bool,
-    interview_completion_rate: float = 0.5,
+    interview_completion_rate: float = -1.0,
     offer_acceptance_rate: float = -1.0,
-    github_activity_score: float = -1.0,
 ) -> float:
     """
-    Availability / track-record signal.
+    Availability signal. Seven sub-signals + social proof + reachability.
 
-    interview_completion_rate, offer_acceptance_rate, and github_activity_score
-    were being extracted into features.parquet by 01_extract_features.py but
-    were never wired into this function (interview_completion_rate had even
-    been explicitly removed from the signature at one point — "I1 fix" — and
-    never reinstated). All three are real signals a recruiter would actually
-    look at ("decent activity in terms of socials, github, response time,
-    interview completion and acceptance rate") and are added back here.
+    interview_completion_rate / offer_acceptance_rate: re-added (Scoring_plan
+    Tier 3, #16-17). Both were already extracted into features.parquet but
+    never consumed here — interview_completion_rate was explicitly removed as
+    a "dead parameter" in an earlier pass (the I1 fix), and
+    offer_acceptance_rate was extracted but never wired in at all. That
+    earlier fix addressed the dead-code symptom but not the missing signal.
+    Both map directly onto jd.txt's closing instruction to down-weight
+    "perfect-on-paper" candidates who aren't actually reachable/available for
+    hiring purposes — a candidate who repeatedly drops out of interview loops
+    or declines offers is not actually available, independent of technical
+    fit. -1 sentinel (no history) -> neutral 0.5, the same convention already
+    used for avg_response_time_hours.
 
-    avg_response_time_hours / offer_acceptance_rate / github_activity_score:
-    -1 means no history -> treated as neutral (0.5), not penalized. Many
-    strong candidates simply have no GitHub linked or no offer history yet —
-    that's an absence of data, not a negative signal.
-    interview_completion_rate: plain 0-1 rate per the schema, no -1 sentinel.
+    avg_response_time_hours: -1 means no history → treated as neutral (0.5).
     saved_by_recruiters_30d: capped at 20 to avoid over-rewarding in-demand candidates.
     """
     # Recency
@@ -266,22 +457,9 @@ def compute_availability_score(
     else:
         response_time_score = 0.10
 
-    # Interview completion — direct 0-1 rate, no sentinel case in this field
-    interview_score = max(0.0, min(1.0, float(interview_completion_rate)))
-
-    # Offer acceptance — historical rate; -1 = no offer history yet → neutral
-    if offer_acceptance_rate is None or offer_acceptance_rate < 0:
-        offer_score = 0.5
-    else:
-        offer_score = max(0.0, min(1.0, float(offer_acceptance_rate)))
-
-    # GitHub activity — -1/None = no GitHub linked → neutral, NOT penalized
-    # (plenty of strong candidates, especially from closed-source product
-    # companies, just don't have public activity tied to their account).
-    if github_activity_score is None or github_activity_score < 0:
-        github_score = 0.5
-    else:
-        github_score = max(0.0, min(1.0, float(github_activity_score) / 100.0))
+    # Interview completion / offer acceptance (-1 = no history → neutral)
+    interview_score = 0.5 if interview_completion_rate < 0 else float(interview_completion_rate)
+    offer_score = 0.5 if offer_acceptance_rate < 0 else float(offer_acceptance_rate)
 
     # Social proof — capped at 20
     social_proof = min(saved_by_recruiters_30d, 20) / 20.0
@@ -290,53 +468,17 @@ def compute_availability_score(
     reachability = 0.5 * float(verified_email) + 0.5 * float(verified_phone)
 
     availability = (
-        0.18 * float(open_to_work) +
-        0.16 * recency +
-        0.13 * float(recruiter_response_rate) +
+        0.22 * float(open_to_work) +
+        0.20 * recency +
+        0.16 * float(recruiter_response_rate) +
         0.13 * notice_score +
-        0.11 * interview_score +
         0.08 * response_time_score +
-        0.08 * offer_score +
-        0.06 * github_score +
+        0.07 * interview_score +
+        0.05 * offer_score +
         0.04 * social_proof +
-        0.03 * reachability
+        0.05 * reachability
     )
-    return min(1.0, availability)
-
-
-def compute_location_multiplier(
-    is_india_based: bool,
-    is_target_city: bool,
-    willing_to_relocate: bool,
-) -> float:
-    """
-    Multiplicative final-score dampener for location/relocation logistics —
-    applied directly to final_score in rank.py, on top of (not instead of)
-    compute_location_fit()'s additive contribution inside structural_score.
-
-    Why a second, multiplicative term is needed: compute_location_fit's effect
-    on final_score was getting diluted to near-irrelevance by the time it
-    passed through structural_score (one term among five) -> prelim_score
-    (one term among three) -> final_score (blended with the cross-encoder,
-    which has ZERO visibility into location at all — it only ever sees JD
-    text vs. candidate profile text). In practice this meant a candidate who
-    is neither in a target city nor willing to relocate could still rank #1
-    purely on text-similarity strength, which doesn't match how a recruiter
-    would actually triage candidates: target-city first, willing-to-relocate
-    next, same-country-but-stuck after that, international last.
-
-    This stays continuous (no hard cutoff/disqualification) — a much-better
-    -fit non-local candidate can still outrank a weaker local one — but now
-    the gap is large enough to actually matter, not just exist on paper.
-    """
-    if not is_india_based:
-        return 0.78 if willing_to_relocate else 0.55
-    if is_target_city:
-        return 1.00
-    elif willing_to_relocate:
-        return 0.95
-    else:
-        return 0.85
+    return min(1.0, max(0.0, availability))
 
 
 def generate_reasoning(row: dict) -> str:
@@ -370,6 +512,8 @@ def generate_reasoning(row: dict) -> str:
     is_target_city    = bool(row.get("is_target_city", False))
     willing_relocate  = bool(row.get("willing_to_relocate", False))
     entire_it         = bool(row.get("entire_career_it_services", False))
+    entire_research   = bool(row.get("entire_career_research_only", False))
+    shallow_ml_only   = bool(row.get("shallow_recent_ml_only", False))
     has_product       = bool(row.get("has_product_company_exp", False))
     has_ml            = bool(row.get("has_ml_production_experience", False))
     yrs_since_ml      = float(row.get("years_since_last_ml_role") if row.get("years_since_last_ml_role") is not None else 99)
@@ -406,6 +550,18 @@ def generate_reasoning(row: dict) -> str:
         # Hard disqualifier — explain why they're in the list at all (low rank)
         s1 = (f"{title} with {yoe_str} years of experience whose entire career "
               f"has been in IT services consulting, which the JD explicitly disqualifies.")
+
+    elif entire_research:
+        # Hard disqualifier — pure research/academic career, no production deployment
+        s1 = (f"{title} with {yoe_str} years of experience whose career has been entirely "
+              f"in research/academic roles with no detected production deployment — the JD "
+              f"is explicit that this is not a fit.")
+
+    elif shallow_ml_only:
+        # Attenuated, not a hard disqualifier — recent, shallow ML/LLM signal only
+        s1 = (f"{title} with {yoe_str} years of experience whose only detected AI/ML signal "
+              f"is a single recent role under a year — the JD specifically flags recent "
+              f"LangChain/API-only experience without substantial prior ML production work.")
 
     elif not has_ml and not has_product:
         # No ML and no product company — weakest structural profile
@@ -445,10 +601,10 @@ def generate_reasoning(row: dict) -> str:
     # ── Sentence 2: Supporting / qualifying signal ────────────────────────────
     # Pick the most informative secondary fact — rotate structure based on what's notable.
 
-    if entire_it:
-        # For disqualified candidates, cite their availability as the reason they appear at all
+    if entire_it or entire_research or shallow_ml_only:
+        # For disqualified/attenuated candidates, cite their availability as the reason they appear at all
         if open_to_work and days_ago <= 30:
-            s2 = (f"Despite the disqualification, they are actively available "
+            s2 = (f"Despite this, they are actively available "
                   f"(open to work, last active {days_ago} days ago, response rate {response_rate:.0%}).")
         else:
             s2 = (f"Their recruiter response rate is {response_rate:.0%} "
@@ -541,25 +697,49 @@ def compute_structural_score(
     salary_fit: float,
     skill_assessment_bonus: float,
     edu_bonus: float,
+    industry_bonus: float = 0.0,
+    github_bonus: float = 0.0,
 ) -> float:
     """
     Weighted structural score combining all hard-requirement signals.
 
     Weights reflect JD priorities:
-      company background + ML experience (0.30) > location (0.25) > experience band (0.20)
-      > trajectory (0.12) > salary (0.08) > bonuses (additive, max ±0.13)
+      company background + ML experience (0.32) > location (0.25)
+      > experience band (0.20) > trajectory (0.15) > salary (0.02)
+      > bonuses (additive, each individually small)
+
+    salary_fit's weight was cut from 0.08 to 0.02 (not removed — the
+    compute_salary_fit() function and its 0-1 "fit" semantics are unchanged,
+    so any other consumer reading its raw output directly, e.g. sandbox/app.py,
+    is unaffected). jd.txt never states an actual compensation band for this
+    role — the "On location, comp, and logistics" section only covers
+    location and notice period, no numbers — and Scoring_plan explicitly
+    places salary_min_lpa/salary_max_lpa in "Tier 8 — Ignore / Minimal
+    Impact... use them only in derived features." Weighting it at 0.08 meant
+    ranking against an invented number with real influence; 0.02 keeps it as
+    a genuine tiebreaker. trajectory_score's weight was raised from 0.12 to
+    0.15 to compensate, since it now also encodes the title-chasing/job-hop
+    penalty (see 01_extract_features.py) and is more directly JD-grounded
+    than salary ever was.
+
+    industry_bonus / github_bonus: small additive tiebreakers for
+    current_industry (HR-tech/recruiting/marketplace background) and
+    github_activity_score (open-source signal) — both jd.txt nice-to-haves
+    that were previously extracted into features.parquet but never scored.
+    See compute_industry_bonus() / compute_github_bonus().
 
     Bug 4 fix: return min(1.0, ...) — bonuses can push the weighted sum past 1.0
     without the cap. Capped to keep all scores in [0, 1].
     """
     raw = (
-        0.30 * company_fit +
+        0.32 * company_fit +
         0.25 * location_fit +
         0.20 * experience_fit +
-        0.12 * trajectory_score +
-        0.08 * salary_fit
+        0.15 * trajectory_score +
+        0.02 * salary_fit
     )
-    return min(1.0, raw + skill_assessment_bonus + edu_bonus)
+    bonuses = skill_assessment_bonus + edu_bonus + industry_bonus + github_bonus
+    return min(1.0, max(0.0, raw + bonuses))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -573,33 +753,27 @@ def compute_structural_score(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Fusion of BM25 (keyword) + dense (semantic) retrieval.
-# Was 0.35/0.65 — moderated after eval_results.json showed weighting fusion
-# that heavily toward dense pulled Config C down (0.6911 -> 0.6397 vs RRF)
-# on the labeled eval set. The theoretical argument for favoring semantic
-# match still holds (jd.txt's keyword-stuffing trap is real), but a 50-
-# candidate, 10-relevant eval shouldn't be ignored either — this is a more
-# moderate compromise than either extreme. Revisit once the eval set is larger.
-FUSION_BM25_WEIGHT  = 0.45
-FUSION_DENSE_WEIGHT = 0.55
+# Weighted toward dense deliberately: the JD explicitly calls out keyword-
+# stuffing as a trap (jd.txt's closing note), so a confident semantic match
+# should be able to outscore a borderline keyword match, not just tie with it.
+FUSION_BM25_WEIGHT  = 0.35
+FUSION_DENSE_WEIGHT = 0.65
 
 # prelim_score = fusion + structural + availability (pre-cross-encoder).
+# Structural's weight was dropped slightly (was 0.35) now that the dense
+# fusion signal is actually allowed to differentiate (see weighted_score_fusion
+# below) and now that has_ml_production_experience's keyword false-positive
+# bug is fixed — structural no longer needs to carry as much of the load.
 PRELIM_FUSION_WEIGHT       = 0.55
 PRELIM_STRUCTURAL_WEIGHT   = 0.25
 PRELIM_AVAILABILITY_WEIGHT = 0.20
 
-# final_score = prelim_score + cross-encoder.
-# Was 0.30/0.70 — walked back hard after eval_results.json showed Config F
-# (full pipeline incl. cross-encoder) scoring *worse* than Config E (prelim
-# alone, no CE) in both the old run (0.5466 vs 0.6474) and the new one
-# (0.5713 vs 0.7276). That's not noise from one run — it's the same direction
-# twice, with different weights both times. The theoretical case for CE
-# (real cross-attention, more contextual than a single embedding dot product)
-# doesn't survive contact with this specific small CE model on long,
-# multi-topic candidate-profile text — trusting the eval over the theory here.
-# prelim_score now carries most of the final blend; CE is a tiebreaker, not
-# the deciding vote.
-FINAL_PRELIM_WEIGHT = 0.60
-FINAL_CE_WEIGHT     = 0.40
+# final_score = prelim_score + cross-encoder. CE gets more say than before
+# (was 0.60) since it's the one stage with real contextual/semantic judgment
+# (full cross-attention over JD + candidate text), vs. prelim_score which is
+# still partly keyword/rule-driven.
+FINAL_PRELIM_WEIGHT = 0.30
+FINAL_CE_WEIGHT     = 0.70
 
 assert abs(FUSION_BM25_WEIGHT + FUSION_DENSE_WEIGHT - 1.0) < 1e-9
 assert abs(PRELIM_FUSION_WEIGHT + PRELIM_STRUCTURAL_WEIGHT + PRELIM_AVAILABILITY_WEIGHT - 1.0) < 1e-9

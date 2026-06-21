@@ -39,25 +39,6 @@ the extra ~110s:
      gains are less predictable than on GPU — revert if it's not faster).
 If --ce-topn 500 still doesn't fit your 5-minute budget after these, dial it
 down (e.g. --ce-topn 400) — no code changes needed.
-
-Blend weights revised again after eval_results.json came back: Config F
-(full pipeline incl. CE) scored *below* Config E (prelim only, no CE) in both
-the old and new eval runs, so FINAL_CE_WEIGHT was walked back down rather than
-further up — see scoring.py for the exact numbers and reasoning.
-
-Two other gaps closed this round, both straight from re-reading jd.txt /
-the "look at it like a recruiter would" framing:
-  - compute_availability_score now actually uses github_activity_score,
-    interview_completion_rate, and offer_acceptance_rate — all three were
-    being extracted into features.parquet and then silently dropped on the
-    floor before reaching any score.
-  - final_score now gets multiplied by compute_location_multiplier() — the
-    additive location_fit term inside structural_score was real but diluted
-    to near-zero effect by the time it passed through 3 layers of weighted
-    averaging, while the cross-encoder (70%, now 40%, of the final blend)
-    has zero visibility into location at all. This was letting candidates
-    who are neither local nor willing to relocate rank #1 purely on text
-    similarity, which doesn’t match how a recruiter actually triages.
 """
 
 import argparse
@@ -79,8 +60,9 @@ from scoring import (
     compute_availability_score,
     compute_company_fit,
     compute_experience_fit,
+    compute_github_bonus,
+    compute_industry_bonus,
     compute_location_fit,
-    compute_location_multiplier,
     compute_salary_fit,
     compute_structural_score,
     generate_reasoning,
@@ -186,17 +168,21 @@ def rank_candidates(
     def row_structural(row) -> float:
         exp_fit  = compute_experience_fit(row["years_of_experience"])
         loc_fit  = compute_location_fit(
-            row["is_india_based"], row["is_target_city"], row["willing_to_relocate"]
+            row["is_india_based"], row["is_target_city"], row["willing_to_relocate"],
+            row["is_primary_city"],
         )
         comp_fit = compute_company_fit(
             row["entire_career_it_services"], row["has_product_company_exp"],
-            row["has_ml_production_experience"], row["years_since_last_ml_role"]
+            row["has_ml_production_experience"], row["years_since_last_ml_role"],
+            row["entire_career_research_only"], row["shallow_recent_ml_only"],
         )
         sal_fit  = compute_salary_fit(row["salary_min_lpa"], row["salary_max_lpa"])
         return compute_structural_score(
             exp_fit, loc_fit, comp_fit,
             row["trajectory_score"], sal_fit,
             row["skill_assessment_bonus"], row["edu_bonus"],
+            compute_industry_bonus(row["current_industry"]),
+            compute_github_bonus(row["github_activity_score"]),
         )
 
     def row_availability(row) -> float:
@@ -211,7 +197,6 @@ def rank_candidates(
             row["verified_phone"],
             row["interview_completion_rate"],
             row["offer_acceptance_rate"],
-            row["github_activity_score"],
         )
 
     tqdm.pandas(desc="Structural")
@@ -236,8 +221,9 @@ def rank_candidates(
     )
 
     # Hard disqualifiers: zero out before cross-encoder stage
-    df_top.loc[df_top["is_honeypot"],                "prelim_score"] = 0.0
-    df_top.loc[df_top["entire_career_it_services"],   "prelim_score"] = 0.0
+    df_top.loc[df_top["is_honeypot"],                  "prelim_score"] = 0.0
+    df_top.loc[df_top["entire_career_it_services"],     "prelim_score"] = 0.0
+    df_top.loc[df_top["entire_career_research_only"],   "prelim_score"] = 0.0
 
     print(f"  Structural scoring done in {time.time() - t4:.1f}s. Prelim top candidate: "
           f"{df_top.nlargest(1, 'prelim_score')['candidate_id'].iloc[0]}")
@@ -281,32 +267,18 @@ def rank_candidates(
     topN["ce_score"] = ce_scores_norm
 
     # Blend preliminary (structural context) with cross-encoder (relevance
-    # precision). Was 0.30/0.70 favoring CE — walked back to 0.60/0.40 favoring
-    # prelim_score after eval_results.json showed CE consistently hurting NDCG@10
-    # rather than helping (Config F scored below Config E in both eval runs).
-    # See FINAL_PRELIM_WEIGHT/FINAL_CE_WEIGHT in scoring.py for the full rationale.
+    # precision). CE's weight was raised (was 0.40/0.60) — it's the one stage
+    # with real contextual judgment (full cross-attention over JD + candidate
+    # text), vs. prelim_score which is still partly keyword/rule-driven.
     topN["final_score"] = (
         FINAL_PRELIM_WEIGHT * topN["prelim_score"] +
         FINAL_CE_WEIGHT * topN["ce_score"]
     )
 
-    # Location/relocation multiplier — applied directly to final_score, not
-    # just buried as one additive term inside structural_score, because the
-    # cross-encoder has zero visibility into location at all (it only sees
-    # JD text vs. candidate profile text). Without this, a candidate neither
-    # in a target city nor willing to relocate could still rank #1 purely on
-    # text-similarity strength. See compute_location_multiplier() in scoring.py.
-    topN["location_multiplier"] = topN.apply(
-        lambda r: compute_location_multiplier(
-            r["is_india_based"], r["is_target_city"], r["willing_to_relocate"]
-        ),
-        axis=1,
-    )
-    topN["final_score"] = topN["final_score"] * topN["location_multiplier"]
-
     # Re-enforce hard disqualifiers (CE might score disqualified candidates highly)
-    topN.loc[topN["is_honeypot"],               "final_score"] = 0.0
-    topN.loc[topN["entire_career_it_services"],  "final_score"] = 0.0
+    topN.loc[topN["is_honeypot"],                 "final_score"] = 0.0
+    topN.loc[topN["entire_career_it_services"],    "final_score"] = 0.0
+    topN.loc[topN["entire_career_research_only"],  "final_score"] = 0.0
 
     # Final top-100: sort by final_score desc, candidate_id asc (deterministic tiebreak)
     top100 = topN.nlargest(100, "final_score").copy()
