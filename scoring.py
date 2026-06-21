@@ -208,15 +208,26 @@ def compute_availability_score(
     saved_by_recruiters_30d: int,
     verified_email: bool,
     verified_phone: bool,
+    interview_completion_rate: float = 0.5,
+    offer_acceptance_rate: float = -1.0,
+    github_activity_score: float = -1.0,
 ) -> float:
     """
-    Availability signal. Five primary sub-signals + social proof + reachability.
+    Availability / track-record signal.
 
-    Note: interview_completion_rate intentionally NOT a parameter (I1 fix).
-    It was accepted by the function before but never used in the formula body.
-    Removed to avoid dead parameter confusion at Stage 4.
+    interview_completion_rate, offer_acceptance_rate, and github_activity_score
+    were being extracted into features.parquet by 01_extract_features.py but
+    were never wired into this function (interview_completion_rate had even
+    been explicitly removed from the signature at one point — "I1 fix" — and
+    never reinstated). All three are real signals a recruiter would actually
+    look at ("decent activity in terms of socials, github, response time,
+    interview completion and acceptance rate") and are added back here.
 
-    avg_response_time_hours: -1 means no history → treated as neutral (0.5).
+    avg_response_time_hours / offer_acceptance_rate / github_activity_score:
+    -1 means no history -> treated as neutral (0.5), not penalized. Many
+    strong candidates simply have no GitHub linked or no offer history yet —
+    that's an absence of data, not a negative signal.
+    interview_completion_rate: plain 0-1 rate per the schema, no -1 sentinel.
     saved_by_recruiters_30d: capped at 20 to avoid over-rewarding in-demand candidates.
     """
     # Recency
@@ -255,6 +266,23 @@ def compute_availability_score(
     else:
         response_time_score = 0.10
 
+    # Interview completion — direct 0-1 rate, no sentinel case in this field
+    interview_score = max(0.0, min(1.0, float(interview_completion_rate)))
+
+    # Offer acceptance — historical rate; -1 = no offer history yet → neutral
+    if offer_acceptance_rate is None or offer_acceptance_rate < 0:
+        offer_score = 0.5
+    else:
+        offer_score = max(0.0, min(1.0, float(offer_acceptance_rate)))
+
+    # GitHub activity — -1/None = no GitHub linked → neutral, NOT penalized
+    # (plenty of strong candidates, especially from closed-source product
+    # companies, just don't have public activity tied to their account).
+    if github_activity_score is None or github_activity_score < 0:
+        github_score = 0.5
+    else:
+        github_score = max(0.0, min(1.0, float(github_activity_score) / 100.0))
+
     # Social proof — capped at 20
     social_proof = min(saved_by_recruiters_30d, 20) / 20.0
 
@@ -262,15 +290,53 @@ def compute_availability_score(
     reachability = 0.5 * float(verified_email) + 0.5 * float(verified_phone)
 
     availability = (
-        0.25 * float(open_to_work) +
-        0.22 * recency +
-        0.18 * float(recruiter_response_rate) +
-        0.15 * notice_score +
-        0.10 * response_time_score +
-        0.05 * social_proof +
-        0.05 * reachability
+        0.18 * float(open_to_work) +
+        0.16 * recency +
+        0.13 * float(recruiter_response_rate) +
+        0.13 * notice_score +
+        0.11 * interview_score +
+        0.08 * response_time_score +
+        0.08 * offer_score +
+        0.06 * github_score +
+        0.04 * social_proof +
+        0.03 * reachability
     )
     return min(1.0, availability)
+
+
+def compute_location_multiplier(
+    is_india_based: bool,
+    is_target_city: bool,
+    willing_to_relocate: bool,
+) -> float:
+    """
+    Multiplicative final-score dampener for location/relocation logistics —
+    applied directly to final_score in rank.py, on top of (not instead of)
+    compute_location_fit()'s additive contribution inside structural_score.
+
+    Why a second, multiplicative term is needed: compute_location_fit's effect
+    on final_score was getting diluted to near-irrelevance by the time it
+    passed through structural_score (one term among five) -> prelim_score
+    (one term among three) -> final_score (blended with the cross-encoder,
+    which has ZERO visibility into location at all — it only ever sees JD
+    text vs. candidate profile text). In practice this meant a candidate who
+    is neither in a target city nor willing to relocate could still rank #1
+    purely on text-similarity strength, which doesn't match how a recruiter
+    would actually triage candidates: target-city first, willing-to-relocate
+    next, same-country-but-stuck after that, international last.
+
+    This stays continuous (no hard cutoff/disqualification) — a much-better
+    -fit non-local candidate can still outrank a weaker local one — but now
+    the gap is large enough to actually matter, not just exist on paper.
+    """
+    if not is_india_based:
+        return 0.78 if willing_to_relocate else 0.55
+    if is_target_city:
+        return 1.00
+    elif willing_to_relocate:
+        return 0.95
+    else:
+        return 0.85
 
 
 def generate_reasoning(row: dict) -> str:
@@ -507,27 +573,33 @@ def compute_structural_score(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Fusion of BM25 (keyword) + dense (semantic) retrieval.
-# Weighted toward dense deliberately: the JD explicitly calls out keyword-
-# stuffing as a trap (jd.txt's closing note), so a confident semantic match
-# should be able to outscore a borderline keyword match, not just tie with it.
-FUSION_BM25_WEIGHT  = 0.35
-FUSION_DENSE_WEIGHT = 0.65
+# Was 0.35/0.65 — moderated after eval_results.json showed weighting fusion
+# that heavily toward dense pulled Config C down (0.6911 -> 0.6397 vs RRF)
+# on the labeled eval set. The theoretical argument for favoring semantic
+# match still holds (jd.txt's keyword-stuffing trap is real), but a 50-
+# candidate, 10-relevant eval shouldn't be ignored either — this is a more
+# moderate compromise than either extreme. Revisit once the eval set is larger.
+FUSION_BM25_WEIGHT  = 0.45
+FUSION_DENSE_WEIGHT = 0.55
 
 # prelim_score = fusion + structural + availability (pre-cross-encoder).
-# Structural's weight was dropped slightly (was 0.35) now that the dense
-# fusion signal is actually allowed to differentiate (see weighted_score_fusion
-# below) and now that has_ml_production_experience's keyword false-positive
-# bug is fixed — structural no longer needs to carry as much of the load.
 PRELIM_FUSION_WEIGHT       = 0.55
 PRELIM_STRUCTURAL_WEIGHT   = 0.25
 PRELIM_AVAILABILITY_WEIGHT = 0.20
 
-# final_score = prelim_score + cross-encoder. CE gets more say than before
-# (was 0.60) since it's the one stage with real contextual/semantic judgment
-# (full cross-attention over JD + candidate text), vs. prelim_score which is
-# still partly keyword/rule-driven.
-FINAL_PRELIM_WEIGHT = 0.30
-FINAL_CE_WEIGHT     = 0.70
+# final_score = prelim_score + cross-encoder.
+# Was 0.30/0.70 — walked back hard after eval_results.json showed Config F
+# (full pipeline incl. cross-encoder) scoring *worse* than Config E (prelim
+# alone, no CE) in both the old run (0.5466 vs 0.6474) and the new one
+# (0.5713 vs 0.7276). That's not noise from one run — it's the same direction
+# twice, with different weights both times. The theoretical case for CE
+# (real cross-attention, more contextual than a single embedding dot product)
+# doesn't survive contact with this specific small CE model on long,
+# multi-topic candidate-profile text — trusting the eval over the theory here.
+# prelim_score now carries most of the final blend; CE is a tiebreaker, not
+# the deciding vote.
+FINAL_PRELIM_WEIGHT = 0.60
+FINAL_CE_WEIGHT     = 0.40
 
 assert abs(FUSION_BM25_WEIGHT + FUSION_DENSE_WEIGHT - 1.0) < 1e-9
 assert abs(PRELIM_FUSION_WEIGHT + PRELIM_STRUCTURAL_WEIGHT + PRELIM_AVAILABILITY_WEIGHT - 1.0) < 1e-9
