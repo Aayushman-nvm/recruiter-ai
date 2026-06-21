@@ -39,7 +39,6 @@ so the ablation table was measuring a system you don't ship. Fixed.
 
 import json
 import os
-import re
 import sys
 from datetime import date
 from pathlib import Path
@@ -59,17 +58,23 @@ from scoring import (
     PRELIM_AVAILABILITY_WEIGHT,
     PRELIM_FUSION_WEIGHT,
     PRELIM_STRUCTURAL_WEIGHT,
+    PRIMARY_CITIES,
     REFERENCE_DATE,
+    RESEARCH_ONLY_COMPANY_INDICATORS,
+    RESEARCH_ONLY_TITLE_INDICATORS,
     TARGET_CITIES,
     compute_availability_score,
     compute_company_fit,
     compute_education_bonus,
     compute_experience_fit,
+    compute_github_bonus,
+    compute_industry_bonus,
     compute_location_fit,
-    compute_location_multiplier,
     compute_salary_fit,
     compute_skill_assessment_bonus,
     compute_structural_score,
+    get_title_seniority,
+    has_ml_keyword,
     weighted_score_fusion,
 )
 from utils import build_candidate_text
@@ -84,28 +89,17 @@ JD_QUERY_PATH = ROOT / "jd_query.txt"
 # query-side instruction prefix, so there is none here.
 DENSE_MODEL_NAME = "all-MiniLM-L6-v2"
 
-# Same ML_KEYWORDS as 01_extract_features.py — must stay in sync
-ML_KEYWORDS = [
-    "embedding", "vector", "retrieval", "ranking", "recommendation",
-    "llm", "fine-tun", "rag", "semantic search", "sentence-transformer",
-    "faiss", "pinecone", "weaviate", "qdrant", "milvus", "elasticsearch",
-    "bert", "transformer", "nlp", "information retrieval", "learning to rank",
-    "xgboost ranking", "neural ranker", "reranker", "dense retrieval",
-    "search engine", "knowledge graph", "question answering", "vector database",
-    "approximate nearest neighbor", "hnsw", "cosine similarity",
-]
-# Dropped bare "ann" + switched to leading-word-boundary matching — see
-# 01_extract_features.py for the full rationale (the old `kw in desc` substring
-# check matched "llm" inside "fulfillment", "bert" inside "Robert", "ann" inside
-# "channel"/"planning", inflating has_ml_production_experience on ~52% of
-# completely unrelated titles in the real dataset).
-ML_KEYWORD_PATTERN = re.compile(
-    r"\b(?:" + "|".join(re.escape(kw) for kw in ML_KEYWORDS) + r")"
-)
 
-
-def _has_ml_keyword(desc: str) -> bool:
-    return ML_KEYWORD_PATTERN.search(desc) is not None
+def _is_research_only_role(role: dict) -> bool:
+    """Mirrors 01_extract_features.py's helper of the same name — see
+    RESEARCH_ONLY_* constants in scoring.py for the detection rationale."""
+    company = (role.get("company") or "").lower()
+    title = (role.get("title") or "").lower()
+    if any(ind in company for ind in RESEARCH_ONLY_COMPANY_INDICATORS):
+        return True
+    if any(ind in title for ind in RESEARCH_ONLY_TITLE_INDICATORS):
+        return True
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -169,6 +163,7 @@ def extract_features_inline(c: dict) -> dict:
     # ── Location ──────────────────────────────────────────────────────────────
     is_india_based     = country.lower() == "india"
     is_target_city     = any(city in location.lower() for city in TARGET_CITIES)
+    is_primary_city    = any(city in location.lower() for city in PRIMARY_CITIES)
     willing_to_relocate = bool(sig.get("willing_to_relocate", False))
 
     # ── Company type ──────────────────────────────────────────────────────────
@@ -178,8 +173,14 @@ def extract_features_inline(c: dict) -> dict:
         if any(it in (r.get("company") or "").lower() for it in IT_SERVICES_COMPANIES)
     )
     entire_it   = n_total > 0 and n_it == n_total
+
+    # jd.txt hard disqualifier — mirrors 01_extract_features.py.
+    n_research_only  = sum(1 for r in career if _is_research_only_role(r))
+    entire_research  = n_total > 0 and n_research_only == n_total
+
     has_product = any(
         not any(it in (r.get("company") or "").lower() for it in IT_SERVICES_COMPANIES)
+        and not _is_research_only_role(r)
         for r in career
     )
 
@@ -188,15 +189,25 @@ def extract_features_inline(c: dict) -> dict:
     # years_since_last_ml_role captures recency; a hard cutoff caused false negatives.
     has_ml        = False
     yrs_since_ml  = 99.0   # sentinel: "never did ML"
+    n_ml_roles    = 0
+    total_ml_months = 0
 
     for role in career:
         desc = (role.get("description") or "").lower()
-        if _has_ml_keyword(desc):
+        if has_ml_keyword(desc):
             has_ml = True
+            n_ml_roles += 1
+            total_ml_months += (role.get("duration_months", 0) or 0)
             end_raw = role.get("end_date")
             end     = _parse_date(end_raw) if end_raw else REFERENCE_DATE
             yrs_ago = max(0.0, (REFERENCE_DATE - (end or REFERENCE_DATE)).days / 365.25)
             yrs_since_ml = min(yrs_since_ml, yrs_ago)
+
+    # jd.txt: recent LangChain-only AI experience without substantial
+    # pre-LLM-era ML production work — mirrors 01_extract_features.py.
+    shallow_ml_only = (
+        has_ml and n_ml_roles <= 1 and yrs_since_ml <= 1.0 and total_ml_months < 12
+    )
 
     # ── Salary ────────────────────────────────────────────────────────────────
     sal     = (sig.get("expected_salary_range_inr_lpa") or {})
@@ -215,25 +226,12 @@ def extract_features_inline(c: dict) -> dict:
     durations  = [r.get("duration_months", 0) or 0 for r in career]
     avg_tenure = float(sum(durations) / len(durations)) if durations else 0.0
 
-    SENIORITY_HIGH   = {"principal","staff engineer","head of","vp","director","distinguished","fellow","chief"}
-    SENIORITY_SENIOR = {"senior","lead","tech lead","sr.","sr ","staff"}
-    SENIORITY_MID    = {"mid-level","engineer ii","sde ii","swe ii"}
-    SENIORITY_JUNIOR = {"junior","associate","entry","fresher","intern","trainee"}
-
-    def _seniority(title: str) -> int:
-        # Was missing the SENIORITY_MID branch present in 01_extract_features.py's
-        # get_title_seniority() — silently drifted despite the "must stay in sync"
-        # comment on this file. Mid-level titles fell through to the default (3)
-        # instead of (2).
-        t = (title or "").lower()
-        if any(k in t for k in SENIORITY_HIGH):   return 5
-        if any(k in t for k in SENIORITY_SENIOR): return 4
-        if any(k in t for k in SENIORITY_JUNIOR): return 1
-        if any(k in t for k in SENIORITY_MID):    return 2
-        return 3
-
-    tit_now   = _seniority(p.get("current_title", ""))
-    tit_first = _seniority(career[-1].get("title", "") if career else "")
+    # get_title_seniority is now imported from scoring.py (single authoritative
+    # source) instead of a locally-redefined copy — that local copy is what had
+    # silently dropped the SENIORITY_MID branch despite a "must stay in sync"
+    # comment; centralizing removes the drift risk rather than just patching it.
+    tit_now   = get_title_seniority(p.get("current_title", ""))
+    tit_first = get_title_seniority(career[-1].get("title", "") if career else "")
     traj_up   = tit_now > tit_first
 
     tenure_stab  = 1.0 if avg_tenure > 24 else (0.7 if avg_tenure > 12 else 0.3)
@@ -243,7 +241,15 @@ def extract_features_inline(c: dict) -> dict:
         (0.5 if yrs_since_ml <= 2 else
          (0.2 if yrs_since_ml <= 4 else 0.0))
     )
-    traj_score = 0.4 * tenure_stab + 0.3 * float(traj_up) + 0.3 * ml_rec_score
+
+    # Title-chasing penalty — mirrors 01_extract_features.py (jd.txt explicit
+    # "do NOT want" #1). See that file for the full rationale.
+    years_per_role  = (yoe / n_total) if n_total > 0 else yoe
+    is_title_chasing = traj_up and n_total >= 3 and years_per_role < 1.5
+    upward_term = -0.10 if is_title_chasing else 0.3 * float(traj_up)
+
+    traj_score = 0.4 * tenure_stab + upward_term + 0.3 * ml_rec_score
+    traj_score = max(0.0, min(1.0, traj_score))
 
     # ── Availability ──────────────────────────────────────────────────────────
     try:
@@ -255,13 +261,17 @@ def extract_features_inline(c: dict) -> dict:
     return {
         "candidate_id":                c["candidate_id"],
         "years_of_experience":          yoe,
+        "current_industry":             p.get("current_industry", ""),
         "is_india_based":               is_india_based,
         "is_target_city":               is_target_city,
+        "is_primary_city":              is_primary_city,
         "willing_to_relocate":          willing_to_relocate,
         "entire_career_it_services":    entire_it,
+        "entire_career_research_only":  entire_research,
         "has_product_company_exp":      has_product,
         "has_ml_production_experience": has_ml,
         "years_since_last_ml_role":     yrs_since_ml,
+        "shallow_recent_ml_only":       shallow_ml_only,
         "salary_min_lpa":               sal_min,
         "salary_max_lpa":               sal_max,
         "skill_assessment_bonus":       skill_bonus,
@@ -273,12 +283,13 @@ def extract_features_inline(c: dict) -> dict:
         "avg_response_time_hours":      float(sig.get("avg_response_time_hours")
                                               if sig.get("avg_response_time_hours") is not None else -1),
         "notice_period_days":           int(sig.get("notice_period_days", 90) or 90),
+        "interview_completion_rate":    float(sig.get("interview_completion_rate")
+                                              if sig.get("interview_completion_rate") is not None else -1),
+        "offer_acceptance_rate":        float(sig.get("offer_acceptance_rate")
+                                              if sig.get("offer_acceptance_rate") is not None else -1),
         "saved_by_recruiters_30d":      int(sig.get("saved_by_recruiters_30d", 0) or 0),
         "verified_email":               bool(sig.get("verified_email", False)),
         "verified_phone":               bool(sig.get("verified_phone", False)),
-        "interview_completion_rate":    float(sig.get("interview_completion_rate", 0.0) or 0.0),
-        "offer_acceptance_rate":        float(sig.get("offer_acceptance_rate")
-                                              if sig.get("offer_acceptance_rate") is not None else -1),
         "github_activity_score":        float(sig.get("github_activity_score")
                                               if sig.get("github_activity_score") is not None else -1),
         "is_honeypot":                  False,
@@ -293,15 +304,21 @@ def extract_features_inline(c: dict) -> dict:
 def score_structural(feat: dict) -> float:
     return compute_structural_score(
         compute_experience_fit(feat["years_of_experience"]),
-        compute_location_fit(feat["is_india_based"], feat["is_target_city"], feat["willing_to_relocate"]),
+        compute_location_fit(
+            feat["is_india_based"], feat["is_target_city"], feat["willing_to_relocate"],
+            feat["is_primary_city"],
+        ),
         compute_company_fit(
             feat["entire_career_it_services"], feat["has_product_company_exp"],
-            feat["has_ml_production_experience"], feat["years_since_last_ml_role"]
+            feat["has_ml_production_experience"], feat["years_since_last_ml_role"],
+            feat["entire_career_research_only"], feat["shallow_recent_ml_only"],
         ),
         feat["trajectory_score"],
         compute_salary_fit(feat["salary_min_lpa"], feat["salary_max_lpa"]),
         feat["skill_assessment_bonus"],
         feat["edu_bonus"],
+        compute_industry_bonus(feat["current_industry"]),
+        compute_github_bonus(feat["github_activity_score"]),
     )
 
 
@@ -312,7 +329,6 @@ def score_availability(feat: dict) -> float:
         feat["notice_period_days"],  feat["saved_by_recruiters_30d"],
         feat["verified_email"],      feat["verified_phone"],
         feat["interview_completion_rate"], feat["offer_acceptance_rate"],
-        feat["github_activity_score"],
     )
 
 
@@ -447,16 +463,6 @@ def main():
     for cid in cids:
         if cid not in final_scores:
             final_scores[cid] = prelim_scores[cid] * FINAL_PRELIM_WEIGHT
-
-    # Same location/relocation multiplier as rank.py's final_score — mirrors
-    # production exactly (Config E above intentionally does NOT include this,
-    # since it mirrors prelim_score, which is pre-multiplier in production too).
-    for cid in cids:
-        feat = feat_map[cid]
-        mult = compute_location_multiplier(
-            feat["is_india_based"], feat["is_target_city"], feat["willing_to_relocate"]
-        )
-        final_scores[cid] *= mult
 
     config_f_ranked = sorted(cids, key=lambda cid: -final_scores[cid])
     ndcg_f = ndcg_at_k([labels.get(cid, 0) for cid in config_f_ranked])
