@@ -30,6 +30,268 @@ TARGET_CITIES = {
     "mumbai", "bangalore", "bengaluru", "gurgaon", "gurugram", "faridabad",
 }
 
+TIER_1 = {
+    "ahmedabad",
+    "bengaluru",
+    "bangalore",
+    "chennai",
+    "gurgaon",
+    "gurugram",
+    "hyderabad",
+    "kolkata",
+    "mumbai",
+    "new delhi",
+    "delhi",
+    "pune",
+}
+
+TIER_2 = {
+    "agra",
+    "ambala",
+    "amravati",
+    "amritsar",
+    "ananthapur",
+    "asansol",
+    "belagavi",
+    "bhavnagar",
+    "bhiwandi",
+    "bhopal",
+    "bhubaneswar",
+    "calicut",
+    "ch.sambhajinagar",
+    "aurangabad",
+    "chandigarh",
+    "coimbatore",
+    "cuttack",
+    "davangere",
+    "dhanbad",
+    "durg",
+    "bhilai",
+    "faridabad",
+    "gandhinagar",
+    "ghaziabad",
+    "goa",
+    "greater noida",
+    "guntur",
+    "guwahati",
+    "gwalior",
+    "hisar",
+    "howrah",
+    "hooghly",
+    "huballi",
+    "dharwad",
+    "indore",
+    "jabalpur",
+    "jaipur",
+    "jalandhar",
+    "jalgaon",
+    "jamnagar",
+    "jamshedpur",
+    "jodhpur",
+    "kadapa",
+    "kakinada",
+    "kalyan dombivli",
+    "kanpur",
+    "karnal",
+    "kochi",
+    "kolhapur",
+    "kota",
+    "kurnool",
+    "latur",
+    "lucknow",
+    "ludhiana",
+    "madurai",
+    "malegaon",
+    "mangaluru",
+    "mira bhayander",
+    "mohali",
+    "moradabad",
+    "mysuru",
+    "nagpur",
+    "nanded",
+    "nashik",
+    "navi mumbai",
+    "nellore",
+    "nizamabad",
+    "noida",
+    "panchkula",
+    "patna",
+    "prayagraj",
+    "puducherry",
+    "raipur",
+    "rajahmundry",
+    "rajkot",
+    "ranchi",
+    "rohtak",
+    "sagar",
+    "salem",
+    "sangli",
+    "satara",
+    "solapur",
+    "sonipat",
+    "surat",
+    "thane",
+    "thrissur",
+    "tirupathi",
+    "trichy",
+    "trivandrum",
+    "udaipur",
+    "vadodara",
+    "varanasi",
+    "vijayawada",
+    "visakhapatnam",
+    "vizag",
+    "warangal",
+    "yamuna",
+}
+
+TIER_3 = {
+    "ahmednagar",
+    "akola",
+    "aligarh",
+    "alwar",
+    "amalner",
+    "ambajogai",
+    "amreli",
+    "anand",
+    "baramati",
+    "bardoli",
+    "barshi",
+    "bathinda",
+    "becharaji",
+    "beed",
+    "begusarai",
+    "berhampur",
+    "bhadradri kothagudem",
+    "bhandara",
+    "bharatpur",
+    "bharuch",
+    "bhimavaram",
+    "bhusawal",
+    "bidar",
+    "bilaspur",
+    "buldhana",
+    "chalisgaon",
+    "chandrapur",
+    "chiplun",
+    "dahod",
+    "daund",
+    "dharmapuri",
+    "dhule",
+    "eluru",
+    "erode",
+    "gadhinglaj",
+    "gadwal",
+    "gandhidham",
+    "gaya",
+    "godhra",
+    "gondia",
+    "gurdaspur",
+    "hingoli",
+    "hoshangabad",
+    "hosur",
+    "ichalkaranji",
+    "indapur",
+    "islampur",
+    "jagityal",
+    "jalna",
+    "jaysingpur",
+    "jhansi",
+    "jharsuguda",
+    "junagadh",
+    "kachchh",
+    "kutch",
+    "kadi",
+    "kagal",
+    "kalol",
+    "kamareddy",
+    "karad",
+    "karimnagar",
+    "karim nagar",
+    "karwar",
+    "khamgaon",
+    "khammam",
+    "kharar",
+    "kopargaon",
+    "shirdi",
+    "machilipatnam",
+    "mahabubnagar",
+    "mahad",
+    "malvan",
+    "mancherial",
+    "mathura",
+    "mehsana",
+    "modasa",
+    "mundra",
+    "muzaffarpur",
+    "nadiad",
+    "nalgonda",
+    "nandyala",
+    "narsipatnam",
+    "navsari",
+    "nilanga",
+    "nirmal",
+    "north bengal",
+    "omerga",
+    "ongole",
+    "osmanabad",
+    "dharashiv",
+    "ozar",
+    "pachora",
+    "palakkad",
+    "palakollu",
+    "palanpur",
+    "palghar",
+    "boisar",
+    "pandharpur",
+    "parbhani",
+    "patan",
+    "phaltan",
+    "pimpalgaon baswant",
+    "puri",
+    "raigad",
+    "raigarh",
+    "ratnagiri",
+    "ropar",
+    "rupnagar",
+    "sabarkantha",
+    "sakri",
+    "sambalpur",
+    "sangrur",
+    "sawantwadi",
+    "shahada",
+    "nandurbar",
+    "shahapur",
+    "murbad",
+    "shirpur",
+    "siddipet",
+    "silvassa",
+    "sindhudurg",
+    "sinnar",
+    "srikakulam",
+    "tirunelveli",
+    "tuni",
+    "udgir",
+    "udupi",
+    "ujjain",
+    "unjha",
+    "uran",
+    "dronagiri",
+    "valsad",
+    "vapi",
+    "vijapur",
+    "vijayapura",
+    "visnagar",
+    "vizianagaram",
+    "vyara",
+    "wanaparthy",
+    "wani",
+    "wardha",
+    "washim",
+    "yavatmal",
+    "zirakpur",
+}
+
 # ── IT services companies ────────────────────────────────────────────────────
 # Explicit disqualifier in JD: entire career in IT services consulting.
 IT_SERVICES_COMPANIES = {
@@ -699,6 +961,8 @@ def compute_structural_score(
     edu_bonus: float,
     industry_bonus: float = 0.0,
     github_bonus: float = 0.0,
+    n_it_services_roles: int = 0,
+    job_hop_score: float = 0.0,
 ) -> float:
     """
     Weighted structural score combining all hard-requirement signals.
@@ -728,6 +992,26 @@ def compute_structural_score(
     that were previously extracted into features.parquet but never scored.
     See compute_industry_bonus() / compute_github_bonus().
 
+    n_it_services_roles: graduated penalty per Scoring_plan Tier 5.
+    entire_career_it_services is the hard disqualifier (score=0.0 from
+    company_fit), but a candidate with 2-3 IT services roles and a product
+    company isn't a hard disqualifier — they should still lose ground vs a
+    pure product-company background. Previously n_it_services_roles was
+    extracted into features.parquet but never consumed here.
+      0 roles:  no penalty
+      1-2 roles: -0.02 (minor — product company present, IT is partial)
+      3-4 roles: -0.04 (moderate — spent majority of career in IT services)
+      5+ roles:  -0.06 (strong — effectively IT-services-dominant career)
+
+    job_hop_score: title-chasing penalty per Scoring_plan Tier 5.
+    JD explicitly disqualifies "optimizing for Senior→Staff→Principal titles
+    by switching companies every 1.5 years." job_hop_score =
+    years_of_experience / n_total_roles. Higher = more stable (stayed longer
+    per company). Values < 1.5 years-per-company get a negative adjustment.
+      >= 2.5 yr/company: no penalty (good tenure)
+      1.5–2.5 yr/company: -0.02 (title-chasing risk)
+      < 1.5 yr/company:  -0.05 (strong title-chasing signal per JD)
+
     Bug 4 fix: return min(1.0, ...) — bonuses can push the weighted sum past 1.0
     without the cap. Capped to keep all scores in [0, 1].
     """
@@ -738,8 +1022,30 @@ def compute_structural_score(
         0.15 * trajectory_score +
         0.02 * salary_fit
     )
+
+    # Graduated IT services penalty (Scoring_plan Tier 5 — n_it_services_roles)
+    if n_it_services_roles >= 5:
+        it_penalty = -0.06
+    elif n_it_services_roles >= 3:
+        it_penalty = -0.04
+    elif n_it_services_roles >= 1:
+        it_penalty = -0.02
+    else:
+        it_penalty = 0.0
+
+    # Job-hopping penalty (Scoring_plan Tier 5 — job_hop_score = yoe / n_total_roles)
+    if job_hop_score <= 0:
+        hop_penalty = 0.0     # no data — neutral
+    elif job_hop_score < 1.5:
+        hop_penalty = -0.05   # < 1.5 yr/company: strong title-chasing signal
+    elif job_hop_score < 2.5:
+        hop_penalty = -0.02   # 1.5–2.5 yr/company: moderate concern
+    else:
+        hop_penalty = 0.0     # >= 2.5 yr/company: stable enough
+
     bonuses = skill_assessment_bonus + edu_bonus + industry_bonus + github_bonus
-    return min(1.0, max(0.0, raw + bonuses))
+    total = raw + bonuses + it_penalty + hop_penalty
+    return min(1.0, max(0.0, total))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

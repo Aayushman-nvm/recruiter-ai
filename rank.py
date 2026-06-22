@@ -183,6 +183,8 @@ def rank_candidates(
             row["skill_assessment_bonus"], row["edu_bonus"],
             compute_industry_bonus(row["current_industry"]),
             compute_github_bonus(row["github_activity_score"]),
+            int(row.get("n_it_services_roles", 0) or 0),
+            float(row.get("job_hop_score", 0.0) or 0.0),
         )
 
     def row_availability(row) -> float:
