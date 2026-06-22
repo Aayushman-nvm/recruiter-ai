@@ -319,6 +319,8 @@ def score_structural(feat: dict) -> float:
         feat["edu_bonus"],
         compute_industry_bonus(feat["current_industry"]),
         compute_github_bonus(feat["github_activity_score"]),
+        int(feat.get("n_it_services_roles", 0) or 0),
+        float(feat.get("job_hop_score", 0.0) or 0.0),
     )
 
 
