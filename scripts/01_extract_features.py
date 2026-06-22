@@ -285,6 +285,7 @@ def extract_features(c: dict) -> dict:
         "n_research_only_roles":       n_research_only_roles,
         "entire_career_research_only": entire_career_research_only,
         "has_product_company_exp":     has_product_company_exp,
+        "job_hop_score":               years_per_role,   # = yoe / n_total_roles; used in Scoring_plan Tier 5
         # ML experience
         "has_ml_production_experience": has_ml_production_experience,
         "years_since_last_ml_role":    years_since_last_ml_role,
