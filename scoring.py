@@ -1,17 +1,45 @@
 """
 scoring.py — Pure scoring functions. Single source of truth.
 
-Constants (keywords, companies, cities, seniority, salary) now live in
-config/ — import them from there. This file only contains:
+Constants (keywords, companies, cities, seniority, salary, weights) now live
+in config/ — import them from there. This file only contains:
   - REFERENCE_DATE
   - compute_*() scoring functions
   - generate_reasoning()
   - compute_structural_score()
-  - Pipeline blend weights (PRELIM_*, FINAL_*, FUSION_*)
-  - weighted_score_fusion() / rrf_fusion()  (re-exported from pipeline/fusion)
 
-Backward-compatible re-exports keep existing `from scoring import X` calls
-working without changes in rank.py, 01_extract_features.py, and 04_eval.py.
+FIX (circular dependency + single source of truth for weights):
+  Pipeline blend weights (PRELIM_*, FINAL_*, FUSION_*) have been moved to
+  config/weights.py. They are re-exported here for backward compatibility so
+  existing `from scoring import PRELIM_FUSION_WEIGHT` calls keep working.
+  The old arrangement had scoring.py importing from pipeline/fusion.py for
+  the fusion weights, while pipeline/fusion.py could need scoring.py —
+  a circular import waiting to happen. config/weights.py has no deps on
+  either module, breaking the cycle cleanly.
+
+FIX (notice period cliff):
+  Notice score for 90–120 days softened from 0.15 → 0.25.
+  JD says "30+ day candidates still in scope but bar gets higher."
+  The old flat 0.15 for anything over 90 days was too close to disqualified.
+  Notice tier constants now live in config/weights.py.
+
+FIX (score penalty + cap for over-experience / stale ML):
+  compute_final_score_with_cap() applies a penalty multiplier (0.82) then
+  a hard ceiling (0.74) when experience_fit < 0.50 (>15 years total) OR
+  years_since_last_ml > 2.0. Penalty-then-cap is better than cap alone
+  because a pure cap collapses all breaching candidates to the same score,
+  losing relative ordering within the penalised group. Multiply first to
+  preserve separation, cap second to enforce the structural ceiling.
+
+FIX (reasoning — two independent negative signals):
+  generate_reasoning() now detects when BOTH location and notice period are
+  negative, and encodes both into sentence 2 rather than picking one.
+  Previously sentence 2 priority logic meant one signal silently won out.
+
+FIX (reasoning — IT-services attribution):
+  The n_it note in sentence 2 previously always referenced current_company,
+  which was misleading when the IT-services role was historical. It now
+  says "in career history" without attributing to the current employer.
 """
 
 from datetime import date
@@ -36,10 +64,31 @@ from config.seniority  import (
 )
 from config.salary     import SALARY_TARGET_MIN, SALARY_TARGET_MAX
 
-# ── Pipeline fusion re-exports (backward compat) ─────────────────────────────
-from pipeline.fusion import (
+# ── Weight re-exports (backward compat) ──────────────────────────────────────
+# Canonical values live in config/weights.py — imported here so existing
+# `from scoring import PRELIM_FUSION_WEIGHT` calls keep working unchanged.
+from config.weights import (
     FUSION_BM25_WEIGHT,
     FUSION_DENSE_WEIGHT,
+    PRELIM_FUSION_WEIGHT,
+    PRELIM_STRUCTURAL_WEIGHT,
+    PRELIM_AVAILABILITY_WEIGHT,
+    FINAL_PRELIM_WEIGHT,
+    FINAL_CE_WEIGHT,
+    SCORE_PENALTY_MULTIPLIER,
+    SCORE_CAP_MAX,
+    SCORE_CAP_EXP_FIT_FLOOR,
+    SCORE_CAP_ML_RECENCY_YEARS,
+    NOTICE_SCORE_0_15,
+    NOTICE_SCORE_16_30,
+    NOTICE_SCORE_31_60,
+    NOTICE_SCORE_61_90,
+    NOTICE_SCORE_91_120,
+    NOTICE_SCORE_120P,
+)
+
+# ── Pipeline fusion re-exports (backward compat) ─────────────────────────────
+from pipeline.fusion import (
     weighted_score_fusion,
     rrf_fusion,
 )
@@ -48,22 +97,6 @@ from pipeline.fusion import (
 # Fixed reference point for all date-relative computations.
 # Must be >= the latest last_active_date in the dataset.
 REFERENCE_DATE = date(2026, 5, 28)
-
-
-# ── Pipeline blend weights ────────────────────────────────────────────────────
-# prelim_score = fusion + structural + availability (pre-cross-encoder)
-PRELIM_FUSION_WEIGHT       = 0.55
-PRELIM_STRUCTURAL_WEIGHT   = 0.25
-PRELIM_AVAILABILITY_WEIGHT = 0.20
-
-# final_score = prelim_score + cross-encoder
-# CE gets more weight — it's the only stage with full cross-attention over
-# JD + candidate text vs prelim which is still partly keyword/rule-driven.
-FINAL_PRELIM_WEIGHT = 0.30
-FINAL_CE_WEIGHT     = 0.70
-
-assert abs(PRELIM_FUSION_WEIGHT + PRELIM_STRUCTURAL_WEIGHT + PRELIM_AVAILABILITY_WEIGHT - 1.0) < 1e-9
-assert abs(FINAL_PRELIM_WEIGHT + FINAL_CE_WEIGHT - 1.0) < 1e-9
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -75,11 +108,11 @@ def compute_experience_fit(years: float) -> float:
     """
     Score experience match. Sweet spot: 5–9 years.
 
-    Curve changes (vs original):
-      4–5 yrs: 0.75 (was 0.82) — just below band, small but real gap
-      3–4 yrs: 0.55 (was 0.65) — meaningful under-experience
-      >15 yrs: 0.40 (was 0.55) — high probability of no longer writing
-                                   production code (JD explicit concern)
+      4–5 yrs: 0.75 — just below band, small but real gap
+      3–4 yrs: 0.55 — meaningful under-experience
+      >15 yrs: 0.40 — high probability of no longer writing production code
+                       (JD explicit concern; also triggers score cap in
+                        compute_final_score_with_cap when < 0.50 threshold)
     """
     if 5 <= years <= 9:    return 1.0
     elif 9 < years <= 12:  return 0.82
@@ -104,7 +137,7 @@ def compute_location_fit(
       JD-welcomed India city:    0.88
       India, willing to relocate: 0.78
       India, other city:         0.52
-      abroad, willing to self-relocate: 0.55  (was 0.45 — case-by-case per JD)
+      abroad, willing to self-relocate: 0.55
       abroad, not willing:       0.15
     """
     if not is_india_based:
@@ -128,7 +161,7 @@ def compute_company_fit(
 
     Hard disqualifiers (return 0.0):
       - entire career in IT services (jd.txt explicit)
-      - entire career in pure research with no production deployment (jd.txt explicit)
+      - entire career in pure research with no production deployment
 
     shallow_recent_ml_only: recent LangChain-only experience without prior
     depth — treated as if no ML experience for scoring purposes.
@@ -225,23 +258,32 @@ def compute_availability_score(
     interview_completion_rate: float = -1.0,
     offer_acceptance_rate: float = -1.0,
 ) -> float:
-    """Composite availability signal. All sub-scores in [0, 1]."""
-    # Recency
-    if last_active_days_ago <= 14:   recency = 1.0
-    elif last_active_days_ago <= 30: recency = 0.85
-    elif last_active_days_ago <= 90: recency = 0.55
-    elif last_active_days_ago <= 180: recency = 0.25
-    else:                            recency = 0.08
+    """
+    Composite availability signal. All sub-scores in [0, 1].
 
-    # Notice period
-    if notice_period_days <= 15:   notice_score = 1.0
-    elif notice_period_days <= 30: notice_score = 0.85
-    elif notice_period_days <= 60: notice_score = 0.60
-    elif notice_period_days <= 90: notice_score = 0.35
-    else:                          notice_score = 0.15
+    FIX (notice period cliff): the 90-day tier is now split into
+    91–120 days (0.25) and > 120 days (0.15).  Previously everything
+    above 90 days got 0.15, which was too close to a hard disqualifier.
+    The JD explicitly says "30+ day candidates are still in scope."
+    Notice tier constants are defined in config/weights.py.
+    """
+    # Recency
+    if last_active_days_ago <= 14:    recency = 1.0
+    elif last_active_days_ago <= 30:  recency = 0.85
+    elif last_active_days_ago <= 90:  recency = 0.55
+    elif last_active_days_ago <= 180: recency = 0.25
+    else:                             recency = 0.08
+
+    # Notice period — sourced from config/weights.py
+    if notice_period_days <= 15:        notice_score = NOTICE_SCORE_0_15
+    elif notice_period_days <= 30:      notice_score = NOTICE_SCORE_16_30
+    elif notice_period_days <= 60:      notice_score = NOTICE_SCORE_31_60
+    elif notice_period_days <= 90:      notice_score = NOTICE_SCORE_61_90
+    elif notice_period_days <= 120:     notice_score = NOTICE_SCORE_91_120
+    else:                               notice_score = NOTICE_SCORE_120P
 
     # Response time (-1 = no history → neutral 0.5)
-    if avg_response_time_hours < 0:    response_time_score = 0.5
+    if avg_response_time_hours < 0:     response_time_score = 0.5
     elif avg_response_time_hours <= 4:  response_time_score = 1.0
     elif avg_response_time_hours <= 24: response_time_score = 0.75
     elif avg_response_time_hours <= 72: response_time_score = 0.40
@@ -303,13 +345,52 @@ def compute_structural_score(
     elif n_it_services_roles >= 1: it_penalty = -0.02
     else:                          it_penalty = 0.0
 
-    if job_hop_score <= 0:        hop_penalty = 0.0
-    elif job_hop_score < 1.5:     hop_penalty = -0.05
-    elif job_hop_score < 2.5:     hop_penalty = -0.02
-    else:                         hop_penalty = 0.0
+    if job_hop_score <= 0:    hop_penalty = 0.0
+    elif job_hop_score < 1.5: hop_penalty = -0.05
+    elif job_hop_score < 2.5: hop_penalty = -0.02
+    else:                     hop_penalty = 0.0
 
     bonuses = skill_assessment_bonus + edu_bonus + industry_bonus + github_bonus
     return min(1.0, max(0.0, raw + bonuses + it_penalty + hop_penalty))
+
+
+def compute_final_score_with_cap(
+    prelim_score: float,
+    ce_score: float,
+    experience_fit: float,
+    years_since_last_ml_role: float,
+) -> float:
+    """
+    Blend prelim_score and ce_score, then apply penalty + ceiling if
+    structural disqualifiers are present.
+
+    WHY PENALTY + CAP (not just cap):
+    A pure cap collapses all breaching candidates to the same ceiling score,
+    losing differentiation within the penalised group. Example: a 16yr
+    candidate with great availability (raw 0.88) and one with poor
+    availability (raw 0.79) both hit 0.74 — their relative ordering is gone.
+
+    Penalty first: multiply by SCORE_PENALTY_MULTIPLIER (0.82), which
+    proportionally compresses the score while preserving relative ordering.
+    Cap second: if the penalised score still exceeds SCORE_CAP_MAX (0.74),
+    clamp it there. This ensures even the best penalised candidate lands
+    below the typical active-ML 5-7yr product-company range (~0.76+).
+
+    Two conditions trigger this treatment (either is sufficient):
+      1. experience_fit < SCORE_CAP_EXP_FIT_FLOOR  (>15 yrs — JD flags risk)
+      2. years_since_last_ml_role > SCORE_CAP_ML_RECENCY_YEARS  (stale ML)
+
+    All constants live in config/weights.py.
+    """
+    raw = FINAL_PRELIM_WEIGHT * prelim_score + FINAL_CE_WEIGHT * ce_score
+    needs_penalty = (
+        experience_fit < SCORE_CAP_EXP_FIT_FLOOR
+        or years_since_last_ml_role > SCORE_CAP_ML_RECENCY_YEARS
+    )
+    if needs_penalty:
+        penalised = raw * SCORE_PENALTY_MULTIPLIER
+        return min(penalised, SCORE_CAP_MAX)
+    return raw
 
 
 def generate_reasoning(row: dict) -> str:
@@ -318,6 +399,15 @@ def generate_reasoning(row: dict) -> str:
 
     Sentence 1: dominant signal (disqualifiers first, then strongest positive).
     Sentence 2: concrete secondary fact that qualifies or reinforces sentence 1.
+
+    FIX (two negative signals): when both location AND notice period are
+    problematic, sentence 2 now combines both instead of picking one.
+    Previously the priority ladder silently dropped one signal.
+
+    FIX (IT-services attribution): the "n IT-services role(s)" note in
+    sentence 2 no longer references current_company, because the IT-services
+    role may be historical. It now says "in career history" to avoid
+    misleadingly attributing the flag to Razorpay, PharmEasy, etc.
     """
     title        = str(row.get("current_title", "candidate") or "candidate").strip()
     yoe          = float(row.get("years_of_experience", 0) or 0)
@@ -355,6 +445,11 @@ def generate_reasoning(row: dict) -> str:
     yoe_str     = f"{yoe:.1f}"
     loc_str     = f"{location}, {country}" if location and country else (location or country or "unknown location")
     company_str = company if company else "their current employer"
+
+    # ── Pre-compute condition flags used by both sentences ────────────────────
+    location_negative = is_india and not is_target_city and not willing_relocate
+    abroad_candidate  = not is_india
+    notice_long       = notice_days > 90
 
     # ── Sentence 1: Lead signal ───────────────────────────────────────────────
     if entire_it:
@@ -401,6 +496,7 @@ def generate_reasoning(row: dict) -> str:
               f"ranked {rank} based on a combination of semantic fit and structured signals.")
 
     # ── Sentence 2: Supporting / qualifying signal ────────────────────────────
+
     if entire_it or entire_research or shallow_ml_only:
         if open_to_work and days_ago <= 30:
             s2 = (f"Despite this, they are actively available "
@@ -409,8 +505,7 @@ def generate_reasoning(row: dict) -> str:
             s2 = (f"Their recruiter response rate is {response_rate:.0%} "
                   f"and they were last active {days_ago} days ago.")
 
-    elif not is_india:
-        # Fix F: distinguish self-funded relocation from refusal
+    elif abroad_candidate:
         if willing_relocate:
             s2 = (f"Based in {loc_str} and willing to self-fund relocation to India — "
                   f"the JD handles these cases individually (no visa sponsorship).")
@@ -418,23 +513,33 @@ def generate_reasoning(row: dict) -> str:
             s2 = (f"Based in {loc_str} and not willing to relocate — "
                   f"significant location mismatch for a Noida/Pune-based role.")
 
-    elif notice_days > 90:
-        # Fix E: long notice is a concrete hiring blocker — surface it first
+    elif notice_long and location_negative:
+        # FIX: both negative signals present — encode both explicitly
+        severity = "minor" if n_it <= 2 else ("moderate" if n_it <= 4 else "strong")
+        it_note = (f" Additionally, {n_it} IT-services role(s) in career history — "
+                   f"{severity} JD-concern penalty applied.")  if n_it >= 1 else ""
+        s2 = (f"Notice period of {notice_days} days and located in {loc_str} "
+              f"(non-preferred city, not open to relocation) — two practical hiring friction points.{it_note}")
+
+    elif notice_long:
+        # FIX (IT-services attribution): say "in career history" not "including {current_company}"
         it_note = ""
         if n_it >= 1:
-            it_note = (f" Note: {n_it} IT-services role(s) detected "
-                       f"(including {company_str}) — a graduated penalty applies per the JD.")
+            severity = "minor" if n_it <= 2 else ("moderate" if n_it <= 4 else "strong")
+            it_note = (f" Additionally, {n_it} IT-services role(s) detected in career history "
+                       f"— {severity} JD-concern penalty applied.")
         s2 = (f"Notice period of {notice_days} days exceeds the JD's preferred 30-day "
               f"buyout window — a practical hiring delay.{it_note}")
 
     elif n_it >= 1 and not entire_it:
-        # Fix E: partial IT-services career — explain the penalty
+        # FIX (IT-services attribution): removed "including {company_str}" to avoid
+        # attributing the flag to the current employer when it's a historical role
         severity = "minor" if n_it <= 2 else ("moderate" if n_it <= 4 else "strong")
-        s2 = (f"{n_it} IT-services role(s) in career history "
-              f"(including {company_str}) — {severity} JD-concern penalty applied; "
+        s2 = (f"{n_it} IT-services role(s) in career history — "
+              f"{severity} JD-concern penalty applied; "
               f"not a hard disqualifier given prior product-company experience.")
 
-    elif is_india and not is_target_city and not willing_relocate:
+    elif location_negative:
         s2 = (f"Currently in {loc_str}, not in a JD-preferred city and not open to relocation "
               f"— partial location fit only.")
 
