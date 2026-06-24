@@ -8,26 +8,21 @@ cosine 0.32 get identical credit if they're both rank #1 in their list.
 
 This module uses min-max normalised weighted sum fusion instead, so how
 confident each method was directly affects the fused score, not just
-whether it ranked first. This matters specifically for this JD because
-keyword overlap is an explicit trap (jd.txt closing note) — a strong
-semantic match must be able to outscore a borderline keyword match.
+whether it ranked first.
+
+FIX: weights now imported from config.weights (the single source of truth)
+instead of being defined here. The old approach caused a circular-dependency
+risk: scoring.py imported from pipeline/fusion.py for the weights, and
+pipeline/fusion.py would have needed to import from scoring.py for other
+things. config.weights has no dependencies on either, so any module can
+safely import from it.
 
 rrf_fusion() is kept for backward compatibility (sandbox/app.py may use it).
 """
 
 import numpy as np
 
-# Weights imported from config via scoring.py constants re-exported there.
-# Direct import from scoring here would create a circular dependency since
-# scoring.py itself imports from config/. Use the canonical values directly.
-
-# Canonical fusion weights — kept here rather than repeated in rank.py / 04_eval.py.
-# Dense is weighted higher because the JD explicitly calls out keyword-stuffing
-# as a trap, so a confident semantic match should outscore a borderline keyword match.
-FUSION_BM25_WEIGHT  = 0.35
-FUSION_DENSE_WEIGHT = 0.65
-
-assert abs(FUSION_BM25_WEIGHT + FUSION_DENSE_WEIGHT - 1.0) < 1e-9
+from config.weights import FUSION_BM25_WEIGHT, FUSION_DENSE_WEIGHT
 
 
 def _minmax(x: np.ndarray) -> np.ndarray:
@@ -49,6 +44,10 @@ def weighted_score_fusion(
 
     bm25_scores / dense_scores must be positionally aligned with candidate_ids
     (bm25_scores[i] and dense_scores[i] both refer to candidate_ids[i]).
+
+    FIX (non-determinism): candidate_ids order determines the normalisation
+    range. Callers must pass a consistently sorted list to get reproducible
+    results across runs. rank.py sorts by candidate_id before calling this.
 
     Returns {candidate_id: fused_score} for all candidates.
     """
