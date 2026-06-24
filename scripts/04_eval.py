@@ -33,10 +33,16 @@ from pipeline.bm25_retrieval     import run_bm25
 from pipeline.dense_retrieval    import compute_dense_scores
 from pipeline.fusion             import weighted_score_fusion
 from pipeline.cross_encoder      import rerank, MODEL_NAME as CE_MODEL_NAME
-from scoring import (
+# FIX: weights now imported from config.weights (single source of truth).
+# scoring.py re-exports them for backward compat, but importing directly
+# from config.weights avoids any risk of circular imports in future.
+from config.weights import (
     FINAL_CE_WEIGHT, FINAL_PRELIM_WEIGHT,
     PRELIM_AVAILABILITY_WEIGHT, PRELIM_FUSION_WEIGHT, PRELIM_STRUCTURAL_WEIGHT,
+)
+from scoring import (
     compute_availability_score, compute_company_fit, compute_experience_fit,
+    compute_final_score_with_cap,
     compute_github_bonus, compute_industry_bonus, compute_location_fit,
     compute_salary_fit, compute_structural_score,
 )
@@ -162,6 +168,8 @@ def main():
     ndcg_e   = ndcg_at_k([labels.get(c, 0) for c in config_e])
 
     # Config F: + cross-encoder (= final_score)
+    # FIX: use compute_final_score_with_cap() so the eval faithfully reflects
+    # the same capping logic used in rank.py (score cap for >15 yrs or stale ML).
     print("Config F: + cross-encoder...")
     prelim_scores = {c: prelim(c) for c in cids}
     top_ids  = sorted(cids, key=lambda c: -prelim_scores[c])[:min(20, len(cids))]
@@ -170,7 +178,14 @@ def main():
 
     final: dict = {}
     for i, c in enumerate(top_ids):
-        final[c] = FINAL_PRELIM_WEIGHT * prelim_scores[c] + FINAL_CE_WEIGHT * float(ce_norm[i])
+        feat = feat_map[c]
+        exp_fit = compute_experience_fit(feat["years_of_experience"])
+        final[c] = compute_final_score_with_cap(
+            prelim_scores[c],
+            float(ce_norm[i]),
+            exp_fit,
+            feat["years_since_last_ml_role"],
+        )
     for c in cids:
         if c not in final:
             final[c] = prelim_scores[c] * FINAL_PRELIM_WEIGHT
