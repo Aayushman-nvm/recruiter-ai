@@ -52,7 +52,7 @@ SAMPLE_PATH   = ROOT / "dataset" / "sample_candidates.json"
 LABELS_PATH   = ROOT / "eval"    / "manual_labels.json"
 OUT_PATH      = ROOT / "eval"    / "eval_results.json"
 JD_QUERY_PATH = ROOT / "jd_query.txt"
-DENSE_MODEL   = "all-MiniLM-L6-v2"
+DENSE_MODEL   = "BAAI/bge-small-en-v1.5"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -79,7 +79,8 @@ def score_structural(feat: dict) -> float:
     return compute_structural_score(
         compute_experience_fit(feat["years_of_experience"]),
         compute_location_fit(feat["is_india_based"], feat["is_target_city"],
-                             feat["willing_to_relocate"], feat["is_primary_city"]),
+                             feat["willing_to_relocate"], feat["is_primary_city"],
+                             feat.get("is_tier_1_city", False)),
         compute_company_fit(feat["entire_career_it_services"], feat["has_product_company_exp"],
                             feat["has_ml_production_experience"], feat["years_since_last_ml_role"],
                             feat["entire_career_research_only"], feat["shallow_recent_ml_only"]),

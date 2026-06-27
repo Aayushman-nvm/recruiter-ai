@@ -59,7 +59,7 @@ sys.path.insert(0, str(ROOT))
 from utils import build_candidate_text  # noqa: E402 (import after sys.path insert)
 
 # ── Configuration ───────────────────────────────────────────────────────────────
-MODEL_NAME  = "all-MiniLM-L6-v2"   
+MODEL_NAME  = "BAAI/bge-small-en-v1.5"   
 EMBED_DIM   = 384
 
 # Batch size for model.encode() — affects GPU/CPU throughput and peak RAM.

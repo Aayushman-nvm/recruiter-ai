@@ -28,7 +28,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-MODEL_NAME = "all-MiniLM-L6-v2"
+MODEL_NAME = "BAAI/bge-small-en-v1.5"
 # BGE query-side instruction prefix (required for asymmetric encoding)
 BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 
