@@ -5,9 +5,7 @@ Each function scores one dimension of a candidate against the JD.
 All are pure functions with no side effects.
 """
 
-from datetime import date
 
-from config.locations import TARGET_CITIES, PRIMARY_CITIES, TIER_1
 from config.keywords  import SKILL_ASSESSMENT_JD_RELEVANT, INDUSTRY_RELEVANT_KEYWORDS
 from config.salary    import SALARY_TARGET_MIN, SALARY_TARGET_MAX
 from config.weights   import (

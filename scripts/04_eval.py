@@ -21,9 +21,8 @@ import json
 import sys
 from pathlib import Path
 
-import bm25s
 import numpy as np
-from sentence_transformers import CrossEncoder, SentenceTransformer
+from sentence_transformers import SentenceTransformer
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -32,12 +31,12 @@ from pipeline.feature_extraction import extract_features
 from pipeline.bm25_retrieval     import run_bm25
 from pipeline.dense_retrieval    import compute_dense_scores
 from pipeline.fusion             import weighted_score_fusion
-from pipeline.cross_encoder      import rerank, MODEL_NAME as CE_MODEL_NAME
+from pipeline.cross_encoder      import rerank
 # FIX: weights now imported from config.weights (single source of truth).
 # scoring.py re-exports them for backward compat, but importing directly
 # from config.weights avoids any risk of circular imports in future.
 from config.weights import (
-    FINAL_CE_WEIGHT, FINAL_PRELIM_WEIGHT,
+    FINAL_PRELIM_WEIGHT,
     PRELIM_AVAILABILITY_WEIGHT, PRELIM_FUSION_WEIGHT, PRELIM_STRUCTURAL_WEIGHT,
 )
 from scoring import (

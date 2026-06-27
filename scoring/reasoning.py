@@ -9,7 +9,6 @@ Rank-aware: top-10 leads with the positive; mid/tail leads with the dominant fla
 No fixed template — sentence structure varies by candidate profile.
 """
 
-from config.salary import SALARY_TARGET_MIN, SALARY_TARGET_MAX
 
 
 def generate_reasoning(row: dict) -> str:

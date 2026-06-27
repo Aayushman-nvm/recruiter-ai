@@ -19,7 +19,6 @@ import argparse
 import csv
 import gzip
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -209,9 +208,9 @@ def main():
         print(f"Summary CSV → {summary_path}")
 
     print(f"\nDone. Open {out_dir} to inspect:")
-    print(f"  00_summary.csv              — all 100 candidates, key fields")
-    print(f"  candidates/001_CAND_*.json  — full raw profile for rank 1, etc.")
-    print(f"\n⚠️  SUBMISSION WARNING: bin/ is development only — not for submission.")
+    print("  00_summary.csv              — all 100 candidates, key fields")
+    print("  candidates/001_CAND_*.json  — full raw profile for rank 1, etc.")
+    print("\n⚠️  SUBMISSION WARNING: bin/ is development only — not for submission.")
 
 
 if __name__ == "__main__":
