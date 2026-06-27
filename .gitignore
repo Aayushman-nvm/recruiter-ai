@@ -6,3 +6,6 @@ eval/manual_labels.json
 *.pyc
 .DS_Store
 tmp_jd.txt
+
+# Debug stage dumps — written by rank.py --debug. Development only, not for submission.
+bin/
