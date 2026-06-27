@@ -66,6 +66,18 @@ from scoring import (
 
 def load_precomputed(precomputed_dir: str):
     df = pd.read_parquet(f"{precomputed_dir}/features.parquet")
+    REQUIRED_NEW_COLUMNS = [
+        "narrative_text", "narrative_embedding_score",
+        "has_disqualifying_language", "n_ghost_skills",
+        "is_ghost_skill_candidate", "is_cv_speech_primary",
+        "is_cv_speech_no_nlp", "top_jd_skills", "is_tier_1_city",
+    ]
+    missing = [col for col in REQUIRED_NEW_COLUMNS if col not in df.columns]
+    if missing:
+        raise ValueError(
+            f"features.parquet is missing columns: {missing}. "
+            "Re-run scripts/01_extract_features.py to regenerate."
+        )
     with open(f"{precomputed_dir}/candidate_ids.txt") as f:
         candidate_ids = f.read().strip().split("\n")
     embeddings   = np.load(f"{precomputed_dir}/candidate_embeddings.npy").astype(np.float32)
@@ -85,6 +97,7 @@ def _row_structural(row) -> float:
         compute_location_fit(
             row["is_india_based"], row["is_target_city"],
             row["willing_to_relocate"], row["is_primary_city"],
+            row.get("is_tier_1_city", False),
         ),
         compute_company_fit(
             row["entire_career_it_services"], row["has_product_company_exp"],
@@ -99,6 +112,11 @@ def _row_structural(row) -> float:
         compute_github_bonus(row["github_activity_score"]),
         int(row.get("n_it_services_roles", 0) or 0),
         float(row.get("job_hop_score", 0.0) or 0.0),
+        float(row.get("narrative_embedding_score", 0.0) or 0.0),   # narrative_embedding_score
+        bool(row.get("has_disqualifying_language", False)),         # has_disqualifying_language
+        bool(row.get("is_ghost_skill_candidate", False)),           # is_ghost_skill_candidate
+        bool(row.get("is_cv_speech_no_nlp", False)),                # is_cv_speech_no_nlp
+        int(row.get("notice_period_days", 0) or 0),                 # notice_period_days
     )
 
 
@@ -172,15 +190,16 @@ def rank_candidates(
     jd_embedding: np.ndarray,
     candidate_texts: list,
     ce_topn: int = 500,
-    fusion_topn: int = 2000,
+    fusion_topn: int = 5000,
     debug_dir: str | None = None,
 ) -> pd.DataFrame:
     """
     ce_topn:     how many candidates (by prelim score) enter the cross-encoder.
     fusion_topn: how many candidates (by fusion score) proceed to structural scoring.
-                 Widening this improves recall at the cost of Stage 3 time.
-                 Stage 3 is pure pandas arithmetic (~2–8s per 1000 rows on CPU),
-                 so going from 2000 → 5000 typically adds 6–20s — well within budget.
+                 Default raised from 2000 → 5000 to improve recall of the genuine-fit
+                 cluster. Stage 3 is pure pandas arithmetic (~2–8s per 1000 rows on CPU);
+                 5000 rows adds approximately 10–40s versus the 2000-row default.
+                 At 5000 rows, total pipeline time remains within the 5-min cap.
     debug_dir: if set, write per-stage CSVs to this directory.
                ⚠️  SUBMISSION WARNING: only pass debug_dir during development.
     """
@@ -264,6 +283,27 @@ def rank_candidates(
     for col in ("is_honeypot", "entire_career_it_services", "entire_career_research_only"):
         df_top.loc[df_top[col], "prelim_score"] = 0.0
 
+    # R5: CV/speech primary + no NLP narrative → zero prelim score
+    cv_no_nlp_zero = (
+        df_top["is_cv_speech_no_nlp"] &
+        (df_top["narrative_embedding_score"] == 0.0)
+    )
+    df_top.loc[cv_no_nlp_zero, "prelim_score"] = 0.0
+
+    # R2: disqualifying language → zero prelim score, mirrors the final-stage
+    # gate below. Previously this gate only existed AFTER the cross-encoder,
+    # which meant disqualified candidates could still consume a CE slot that
+    # should have gone to a genuinely strong candidate (ce_topn is a hard
+    # budget — wasting slots on candidates that get zeroed anyway hurts
+    # recall for borderline-but-clean candidates just outside ce_topn).
+    # See the matching comment near `disq_zero` in the final-score block for
+    # why `narrative_embedding_score < 0.667` rather than `== 0.0` is correct.
+    disq_zero_prelim = (
+        df_top["has_disqualifying_language"] &
+        (df_top["narrative_embedding_score"] < 0.667)
+    )
+    df_top.loc[disq_zero_prelim, "prelim_score"] = 0.0
+
     t_structural = time.time() - t3
     print(f"  Structural done in {t_structural:.1f}s.")
 
@@ -274,7 +314,9 @@ def rank_candidates(
     # ── Stage 4: Cross-encoder ────────────────────────────────────────────────
     print(f"Stage 4: Cross-encoder (top-{ce_topn})...")
     t4 = time.time()
-    topN        = df_top.nlargest(ce_topn, "prelim_score").copy()
+    # R7: exclude hard-zeroed candidates before taking top-N for CE
+    df_eligible = df_top[df_top["prelim_score"] > 0.0]
+    topN        = df_eligible.nlargest(ce_topn, "prelim_score").copy()
     topN_ids    = topN["candidate_id"].tolist()
     cid_to_text = dict(zip(candidate_ids, candidate_texts))
     topN_texts  = [cid_to_text[cid] for cid in topN_ids]
@@ -294,6 +336,32 @@ def rank_candidates(
     )
     for col in ("is_honeypot", "entire_career_it_services", "entire_career_research_only"):
         topN.loc[topN[col], "final_score"] = 0.0
+
+    # R2: disqualifying language → hard zero, UNLESS the candidate shows strong
+    # independent JD-relevant evidence elsewhere (narrative_embedding_score >= 0.667,
+    # i.e. 2 of 3 JD signal categories evidenced in their OWN narrative).
+    #
+    # Previous gate also required `not has_ml_production_experience`, which meant
+    # the zero only fired for candidates who had no ML experience at all — exactly
+    # the candidates who already scored low on every other axis. The actual leak
+    # was candidates WITH general ML production experience whose narrative still
+    # explicitly admits deployment ownership belonged to someone else for the
+    # ranking/retrieval system the JD cares about. Generic "has done ML" should
+    # not shield an explicit non-ownership admission; only strong, specific
+    # narrative evidence (cat_a/cat_b/cat_c signals — embeddings/vectorDB,
+    # eval-framework, recent hands-on ML) should.
+    disq_zero = (
+        topN["has_disqualifying_language"] &
+        (topN["narrative_embedding_score"] < 0.667)
+    )
+    topN.loc[disq_zero, "final_score"] = 0.0
+
+    # R5: CV/speech primary + no NLP narrative → hard zero final score
+    cv_no_nlp_final = (
+        topN["is_cv_speech_no_nlp"] &
+        (topN["narrative_embedding_score"] == 0.0)
+    )
+    topN.loc[cv_no_nlp_final, "final_score"] = 0.0
 
     t_ce = time.time() - t4
     print(f"  Cross-encoder done in {t_ce:.1f}s.")
@@ -344,7 +412,7 @@ def main():
     parser.add_argument("--no-reasoning", action="store_true")
     parser.add_argument("--ce-topn",      type=int, default=500,
                         help="Candidates entering the cross-encoder (by prelim score).")
-    parser.add_argument("--fusion-topn",  type=int, default=2000,
+    parser.add_argument("--fusion-topn",  type=int, default=5000,
                         help="Shortlist size after fusion (before structural scoring). "
                              "Widening improves recall; Stage 3 costs ~2-8s per 1000 rows.")
     # ⚠️  SUBMISSION WARNING: --debug writes stage CSVs to bin/. Never pass
