@@ -1,0 +1,26 @@
+{
+  "A": {
+    "description": "BM25 only",
+    "ndcg_at_10": 0.8055
+  },
+  "B": {
+    "description": "Dense (all-MiniLM-L6-v2) only",
+    "ndcg_at_10": 0.5959
+  },
+  "C": {
+    "description": "BM25 + Dense (weighted fusion)",
+    "ndcg_at_10": 0.6237
+  },
+  "D": {
+    "description": "C + structural features",
+    "ndcg_at_10": 0.6103
+  },
+  "E": {
+    "description": "D + availability",
+    "ndcg_at_10": 0.6836
+  },
+  "F": {
+    "description": "E + cross-encoder reranker",
+    "ndcg_at_10": 0.5692
+  }
+}
