@@ -12,6 +12,15 @@ Public API:
   is_research_only_role(role)   — True if a career role is purely academic
   extract_features(c)           — Full feature dict for one candidate
   parse_date(s)                 — ISO date string → date or None
+
+Feature columns produced (in addition to legacy columns):
+  narrative_text                (str)   — concatenated career_history[].description
+  narrative_embedding_score     (float) — fraction of JD signal categories evidenced {0.0, 0.333, 0.667, 1.0}
+  has_disqualifying_language    (bool)  — explicit non-ownership/delegation phrase in narrative
+  n_ghost_skills                (int)   — count of GHOST_SKILL_KEYWORDS in skills list absent from narrative
+  is_ghost_skill_candidate      (bool)  — n_ghost_skills >= 3 AND narrative_embedding_score < 0.667
+  is_cv_speech_primary          (bool)  — current title or >50% career roles match CV/speech domain titles
+  is_cv_speech_no_nlp           (bool)  — is_cv_speech_primary AND distinct NLP/IR crossover keywords < 2
 """
 
 from datetime import date
@@ -27,9 +36,13 @@ from config.keywords import (
     RESEARCH_ONLY_COMPANY_INDICATORS,
     RESEARCH_ONLY_TITLE_INDICATORS,
     has_ml_keyword,
+    DISQUALIFYING_PHRASES,
+    GHOST_SKILL_KEYWORDS,
+    CV_SPEECH_DOMAIN_TITLES,
+    NLP_IR_CROSSOVER_KEYWORDS,
 )
 from config.companies import IT_SERVICES_COMPANIES
-from config.locations import TARGET_CITIES, PRIMARY_CITIES
+from config.locations import TARGET_CITIES, PRIMARY_CITIES, TIER_1
 from config.seniority import get_title_seniority
 from scoring import (
     REFERENCE_DATE,
@@ -96,6 +109,7 @@ def extract_features(c: dict, detect_honeypot: bool = True) -> dict:
     is_india_based      = country.lower() == "india"
     is_target_city      = any(city in location.lower() for city in TARGET_CITIES)
     is_primary_city     = any(city in location.lower() for city in PRIMARY_CITIES)
+    is_tier_1_city      = any(city in location.lower() for city in TIER_1)
     willing_to_relocate = bool(sig.get("willing_to_relocate", False))
 
     # ── Company type ──────────────────────────────────────────────────────────
@@ -148,6 +162,76 @@ def extract_features(c: dict, detect_honeypot: bool = True) -> dict:
         and years_since_last_ml_role <= 1.0
         and total_ml_months < 12
     )
+
+    # ── Narrative evidence (R1) ───────────────────────────────────────────────
+    narrative_text = " ".join(
+        (role.get("description") or "")
+        for role in career
+    ).strip()
+    narrative_lower = narrative_text.lower()
+
+    # Category (a): embedding/vector/vectorDB keywords in narrative
+    CAT_A_TERMS = {
+        "embedding", "vector", "vector database", "faiss", "pinecone",
+        "weaviate", "qdrant", "milvus", "elasticsearch", "opensearch",
+        "semantic search", "hybrid search", "hybrid retrieval", "dense retrieval",
+    }
+    # Category (b): eval framework keywords in narrative
+    CAT_B_TERMS = {
+        "ndcg", "mrr", "map", "a/b test", "evaluation framework",
+        "learning to rank",
+    }
+
+    cat_a = any(term in narrative_lower for term in CAT_A_TERMS)
+    cat_b = any(term in narrative_lower for term in CAT_B_TERMS)
+    cat_c = has_ml_production_experience and years_since_last_ml_role <= 1.0
+
+    narrative_embedding_score = (int(cat_a) + int(cat_b) + int(cat_c)) / 3.0
+
+    # ── Disqualifying language (R2) ───────────────────────────────────────────
+    has_disqualifying_language = any(
+        phrase in narrative_lower for phrase in DISQUALIFYING_PHRASES
+    )
+
+    # ── Ghost skills (R3) ────────────────────────────────────────────────────
+    skill_names_lower = {(s.get("name") or "").lower() for s in skills}
+    ghost_skills_found = {
+        kw for kw in GHOST_SKILL_KEYWORDS
+        if kw in skill_names_lower and kw not in narrative_lower
+    }
+    n_ghost_skills = len(ghost_skills_found)
+    is_ghost_skill_candidate = (
+        n_ghost_skills >= 3 and narrative_embedding_score < 0.667
+    )
+
+    # ── Top JD-relevant skills (for reasoning sentence 1) ────────────────────
+    # Pull up to 4 skills that appear in SKILL_ASSESSMENT_JD_RELEVANT,
+    # sorted by endorsements descending so the most credible ones surface first.
+    from config.keywords import SKILL_ASSESSMENT_JD_RELEVANT as _JD_REL
+    skills_sorted = sorted(skills, key=lambda s: s.get("endorsements", 0) or 0, reverse=True)
+    top_jd_skills = ", ".join(
+        s["name"] for s in skills_sorted
+        if any(jd_kw in (s.get("name") or "").lower() for jd_kw in _JD_REL)
+    )[:120]  # cap string length
+
+    # ── CV/speech domain (R5) ────────────────────────────────────────────────
+    current_title_lower = (p.get("current_title") or "").lower()
+    is_cv_speech_primary = any(term in current_title_lower for term in CV_SPEECH_DOMAIN_TITLES)
+
+    if not is_cv_speech_primary and career:
+        cv_speech_role_count = sum(
+            1 for role in career
+            if any(term in (role.get("title") or "").lower() for term in CV_SPEECH_DOMAIN_TITLES)
+        )
+        is_cv_speech_primary = cv_speech_role_count > len(career) / 2
+
+    if is_cv_speech_primary:
+        distinct_crossover = {
+            kw for kw in NLP_IR_CROSSOVER_KEYWORDS if kw in narrative_lower
+        }
+        is_cv_speech_no_nlp = len(distinct_crossover) < 2
+    else:
+        is_cv_speech_no_nlp = False
 
     # ── Salary ────────────────────────────────────────────────────────────────
     sal          = (sig.get("expected_salary_range_inr_lpa") or {})
@@ -278,6 +362,7 @@ def extract_features(c: dict, detect_honeypot: bool = True) -> dict:
         "is_india_based":               is_india_based,
         "is_target_city":               is_target_city,
         "is_primary_city":              is_primary_city,
+        "is_tier_1_city":               is_tier_1_city,
         "willing_to_relocate":          willing_to_relocate,
         # Company type
         "n_total_roles":                n_total_roles,
@@ -320,4 +405,13 @@ def extract_features(c: dict, detect_honeypot: bool = True) -> dict:
         "github_activity_score":        github_activity_score,
         "preferred_work_mode":          preferred_work_mode,
         "is_honeypot":                  is_honeypot,
+        # Narrative evidence (R1–R5)
+        "narrative_text":               narrative_text,
+        "narrative_embedding_score":    narrative_embedding_score,
+        "has_disqualifying_language":   has_disqualifying_language,
+        "n_ghost_skills":               n_ghost_skills,
+        "is_ghost_skill_candidate":     is_ghost_skill_candidate,
+        "is_cv_speech_primary":         is_cv_speech_primary,
+        "is_cv_speech_no_nlp":          is_cv_speech_no_nlp,
+        "top_jd_skills":                top_jd_skills,
     }
