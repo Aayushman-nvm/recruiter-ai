@@ -1,30 +1,29 @@
 """
 scoring/reasoning.py — generate_reasoning() function.
 
-Produces two-sentence recruiter-facing reasoning for each candidate.
-Sentence 1: lead signal (disqualifiers first, then strongest positive).
-Sentence 2: concrete secondary fact that qualifies or reinforces sentence 1.
+Produces two tight sentences for each candidate.
+Sentence 1: strongest signal (what makes or breaks this candidate).
+Sentence 2: the most important logistical or qualifying fact.
 
-Design principles:
-  - Concise: recruiters review 100 candidates; every word must earn its place.
-  - Analytical: sentence 2 surfaces specific measurable flags, not boilerplate.
-  - Location + relocation always present for non-disqualified candidates.
-  - Priority order: hard disqualifiers > narrative evidence > logistics > tiebreakers.
+Rank-aware: top-10 leads with the positive; mid/tail leads with the dominant flag.
+No fixed template — sentence structure varies by candidate profile.
 """
 
 from config.salary import SALARY_TARGET_MIN, SALARY_TARGET_MAX
 
 
 def generate_reasoning(row: dict) -> str:
-    # ── Extract row fields ────────────────────────────────────────────────────
+    # ── Extract fields ────────────────────────────────────────────────────────
     title         = str(row.get("current_title", "candidate") or "candidate").strip()
     yoe           = float(row.get("years_of_experience", 0) or 0)
     company       = str(row.get("current_company", "") or "").strip()
     location      = str(row.get("location", "") or "").strip()
     country       = str(row.get("country", "") or "").strip()
+    rank          = int(row.get("rank", 99) or 99)
 
     is_india         = bool(row.get("is_india_based", False))
-    is_target_city   = bool(row.get("is_target_city", False))
+    is_primary_city  = bool(row.get("is_primary_city", False))
+    is_tier_1_city   = bool(row.get("is_tier_1_city", False))
     willing_relocate = bool(row.get("willing_to_relocate", False))
     entire_it        = bool(row.get("entire_career_it_services", False))
     entire_research  = bool(row.get("entire_career_research_only", False))
@@ -36,194 +35,157 @@ def generate_reasoning(row: dict) -> str:
     avg_tenure       = float(row.get("avg_tenure_months") if row.get("avg_tenure_months") is not None else 0)
     trajectory_up    = bool(row.get("trajectory_upward", False))
 
-    sal_min       = float(row.get("salary_min_lpa") if row.get("salary_min_lpa") is not None else 0)
-    sal_max       = float(row.get("salary_max_lpa") if row.get("salary_max_lpa") is not None else 999)
     open_to_work  = bool(row.get("open_to_work_flag", False))
     days_ago      = int(row.get("last_active_days_ago") if row.get("last_active_days_ago") is not None else 999)
     response_rate = float(row.get("recruiter_response_rate") if row.get("recruiter_response_rate") is not None else 0)
     notice_days   = int(row.get("notice_period_days") if row.get("notice_period_days") is not None else 90)
-    resp_time_hrs = float(row.get("avg_response_time_hours") if row.get("avg_response_time_hours") is not None else -1)
-    saves         = int(row.get("saved_by_recruiters_30d") if row.get("saved_by_recruiters_30d") is not None else 0)
-    skill_bonus   = float(row.get("skill_assessment_bonus") if row.get("skill_assessment_bonus") is not None else 0)
-    edu_tier      = str(row.get("edu_tier", "unknown") or "unknown")
-    ce_score      = float(row.get("ce_score") if row.get("ce_score") is not None else 0)
+    sal_min       = float(row.get("salary_min_lpa") if row.get("salary_min_lpa") is not None else 0)
+    sal_max       = float(row.get("salary_max_lpa") if row.get("salary_max_lpa") is not None else 999)
     n_it          = int(row.get("n_it_services_roles", 0) or 0)
 
     has_disqualifying_lang = bool(row.get("has_disqualifying_language", False))
     n_ghost                = int(row.get("n_ghost_skills", 0) or 0)
     is_ghost               = bool(row.get("is_ghost_skill_candidate", False))
     is_cv_speech_nlp       = bool(row.get("is_cv_speech_no_nlp", False))
+    top_jd_skills          = str(row.get("top_jd_skills", "") or "").strip()
+    ce_score               = float(row.get("ce_score") if row.get("ce_score") is not None else 0)
 
-    # ── Derived strings ───────────────────────────────────────────────────────
-    yoe_str      = f"{yoe:.1f}"
-    loc_str      = f"{location}, {country}" if location and country else (location or country or "unknown location")
-    company_str  = company if company else "their current employer"
-    relocate_str = "open to relocation" if willing_relocate else "not open to relocation"
-    notice_str   = f"{notice_days}d notice"
+    # ── Derived helpers ───────────────────────────────────────────────────────
+    company_str = company if company else "their current company"
+    loc_str     = location if location else country
 
-    # ── Pre-compute condition flags ───────────────────────────────────────────
-    location_negative = is_india and not is_target_city and not willing_relocate
-    abroad_candidate  = not is_india
-    notice_long       = notice_days > 90
-
-    # ── Sentence 1: Lead signal ───────────────────────────────────────────────
-
-    if has_disqualifying_lang and not entire_it and not entire_research:
-        loc_ctx = location if location else loc_str
-        s1 = (f"{title}, {yoe_str}y exp, {company_str} ({loc_ctx}, {relocate_str}, {notice_str}). "
-              f"Career narrative explicitly states production deployment was handled by another team — not an end-to-end owner.")
-
-    elif entire_it:
-        s1 = (f"{title}, {yoe_str}y exp — entire career in IT services consulting, "
-              f"which the JD explicitly disqualifies ({company_str}, {notice_str}).")
-
-    elif entire_research:
-        s1 = (f"{title}, {yoe_str}y exp — career entirely in research/academic roles, "
-              f"no production deployment detected. JD is explicit: not a fit.")
-
-    elif shallow_ml_only:
-        s1 = (f"{title}, {yoe_str}y exp at {company_str}. Only recent (<12mo) LangChain/API-layer "
-              f"ML detected — JD flags this without prior production ML depth as insufficient.")
-
-    elif not has_ml and not has_product:
-        s1 = (f"{title}, {yoe_str}y exp at {company_str} ({notice_str}). "
-              f"No production ML experience and no product-company background detected.")
-
-    elif has_ml and yrs_since_ml <= 1:
-        if yoe > 15:
-            s1 = (f"{title}, {yoe_str}y exp, currently at {company_str} in production ML. "
-                  f"At {yoe_str} years total, JD flags elevated risk of having shifted from hands-on coding to architecture.")
-        else:
-            loc_ctx = location if location else loc_str
-            s1 = (f"{title}, {yoe_str}y exp, currently at {company_str} in production ML "
-                  f"({loc_ctx}, {relocate_str}, {notice_str}).")
-
-    elif has_ml and 1 < yrs_since_ml <= 3:
-        s1 = (f"{title}, {yoe_str}y exp — last production ML role {yrs_since_ml:.1f}y ago at {company_str}. "
-              f"Relevant background, but recency gap is a concern for a hands-on coding role.")
-
-    elif has_ml and yrs_since_ml > 3:
-        s1 = (f"{title}, {yoe_str}y exp — most recent ML role was {yrs_since_ml:.1f}y ago. "
-              f"JD requires active hands-on ML, not historical experience.")
-
-    elif has_product and not has_ml:
-        s1 = (f"{title}, {yoe_str}y exp at product companies incl. {company_str}. "
-              f"No production ML/retrieval/ranking detected in career history.")
-
-    elif ce_score >= 0.7:
-        s1 = (f"{title}, {yoe_str}y exp at {company_str} — strong semantic fit with JD "
-              f"(cross-encoder: {ce_score:.2f}). {location}, {relocate_str}.")
-
+    # Location context string — concise
+    if is_primary_city:
+        loc_ctx = f"{location} (primary city)"
+    elif is_tier_1_city and willing_relocate:
+        loc_ctx = f"{location}, willing to relocate"
+    elif is_tier_1_city:
+        loc_ctx = f"{location}, NOT willing to relocate"
+    elif willing_relocate:
+        loc_ctx = f"{location}, willing to relocate"
+    elif not is_india:
+        loc_ctx = f"{location}, {country}" if location and country else (location or country)
     else:
-        s1 = (f"{title}, {yoe_str}y exp at {company_str} ({notice_str}, {relocate_str}).")
+        loc_ctx = f"{location}, not willing to relocate"
 
-    # ── Sentence 2: Supporting / qualifying signal ────────────────────────────
+    notice_str = f"{notice_days}d notice" if notice_days > 30 else (
+        "immediately available" if notice_days == 0 else f"{notice_days}d notice"
+    )
 
-    if entire_it or entire_research or shallow_ml_only:
-        activity = f"last active {days_ago}d ago" if days_ago < 999 else "activity unknown"
-        s2 = (f"Response rate {response_rate:.0%}, {activity}. "
-              f"{'Open to work. ' if open_to_work else 'Not actively looking. '}"
-              f"Notice: {notice_days}d.")
+    skills_str = f" Skills: {top_jd_skills}." if top_jd_skills else ""
 
-    elif has_disqualifying_lang:
-        notes = []
-        if n_ghost >= 3:
-            notes.append(f"{n_ghost} JD skills claimed but absent from narrative (ghost skills)")
-        if notice_days > 60:
-            notes.append(f"{notice_days}d notice above JD's 30d buyout window")
-        if not is_india:
-            notes.append(f"abroad ({loc_str}{', willing to relocate' if willing_relocate else ', not open to relocation'})")
-        elif not is_target_city and not willing_relocate:
-            notes.append(f"non-preferred city ({location}), not open to relocation")
-        if days_ago > 60:
-            notes.append(f"last active {days_ago}d ago")
-        s2 = ("Additional flags: " + "; ".join(notes) + ".") if notes else (
-            f"Response rate {response_rate:.0%}, last active {days_ago}d ago. Notice: {notice_days}d."
-        )
+    # ── Hard disqualifier cases — these dominate regardless of rank ───────────
+    if entire_it:
+        s1 = f"{title} ({yoe:.1f}y) — entire career in IT services consulting, which the JD explicitly disqualifies."
+        s2 = f"Current company: {company_str}. {notice_str}."
+        return f"{s1} {s2}"
 
-    elif is_cv_speech_nlp:
-        s2 = ("Primary domain is CV/speech with insufficient NLP/IR crossover in narrative. "
-              "JD explicitly flags this: 'you'd be re-learning fundamentals here.'")
+    if entire_research:
+        s1 = f"{title} ({yoe:.1f}y) — career entirely in research/academic roles with no production deployment."
+        s2 = f"JD is explicit: production experience required. {notice_str}."
+        return f"{s1} {s2}"
 
-    elif is_ghost:
-        s2 = (f"{n_ghost} JD-relevant skills listed (e.g. vector DBs, semantic search) "
-              f"but absent from career narrative — keyword stuffing likely. Ghost-skill penalty applied.")
+    if shallow_ml_only:
+        s1 = f"{title} ({yoe:.1f}y) at {company_str} — only recent (<12mo) API-layer ML detected, no pre-LLM-era production depth."
+        s2 = f"JD specifically flags this pattern as insufficient. {loc_ctx}, {notice_str}."
+        return f"{s1} {s2}"
 
-    elif abroad_candidate:
-        if willing_relocate:
-            s2 = (f"Based in {loc_str}, willing to self-fund relocation. "
-                  f"No visa sponsorship — handled case-by-case per JD. Notice: {notice_days}d.")
-        else:
-            s2 = (f"Based in {loc_str}, not willing to relocate. "
-                  f"Significant location mismatch for Noida/Pune role. Notice: {notice_days}d.")
+    if is_cv_speech_nlp:
+        s1 = f"{title} ({yoe:.1f}y) — primary domain is CV/speech with insufficient NLP/IR crossover in narrative."
+        s2 = f"JD explicitly excludes this: 're-learning fundamentals.' {loc_ctx}, {notice_str}."
+        return f"{s1} {s2}"
 
-    elif notice_long and location_negative:
-        it_note = f" {n_it} IT-services role(s) in history." if n_it >= 1 else ""
-        s2 = (f"{notice_days}d notice + non-preferred city ({location}, not open to relocation) "
-              f"— two compounding friction points.{it_note}")
-
-    elif notice_long:
-        it_note = f" {n_it} IT-services role(s) in history." if n_it >= 1 else ""
-        s2 = (f"{notice_days}d notice exceeds JD's 30d buyout window.{it_note} "
-              f"Last active {days_ago}d ago, response rate {response_rate:.0%}.")
-
-    elif n_it >= 1 and not entire_it:
-        severity = "minor" if n_it <= 2 else ("moderate" if n_it <= 4 else "strong")
-        s2 = (f"{n_it} IT-services role(s) in career history — {severity} penalty. "
-              f"Location: {location}, {relocate_str}. Notice: {notice_days}d.")
-
-    elif location_negative:
-        s2 = (f"Non-preferred city ({location}), not open to relocation. "
-              f"Notice: {notice_days}d, last active {days_ago}d ago.")
-
-    elif skill_bonus >= 0.04:
-        s2 = (f"Platform-verified assessments on JD-relevant skills (bonus: {skill_bonus:.3f}). "
-              f"Location: {location}, {relocate_str}. Notice: {notice_days}d.")
-
-    elif traj_score >= 0.8 and trajectory_up:
-        tenure_str = f"{avg_tenure:.0f}mo avg tenure" if avg_tenure > 0 else ""
-        s2 = (f"Upward title trajectory, {tenure_str} — stable, not title-chasing. "
-              f"Location: {location}, {relocate_str}. Notice: {notice_days}d.")
-
+    # ── Trajectory summary helper (used in positive cases) ───────────────────
+    if avg_tenure > 24 and trajectory_up:
+        traj_str = f"stable upward trajectory ({avg_tenure:.0f}mo avg tenure)"
     elif avg_tenure < 15 and avg_tenure > 0:
-        s2 = (f"Avg tenure {avg_tenure:.0f}mo/role — possible title-chasing (JD concern). "
-              f"Location: {location}, {relocate_str}. Notice: {notice_days}d.")
-
-    elif open_to_work and days_ago <= 14 and response_rate >= 0.7:
-        s2 = (f"Actively job-seeking: open to work, last active {days_ago}d ago, "
-              f"{response_rate:.0%} response rate — highly reachable.")
-
-    elif open_to_work and notice_days <= 30:
-        start_str = "immediately" if notice_days == 0 else f"within {notice_days}d"
-        s2 = (f"Open to work, can start {start_str}. "
-              f"Last active {days_ago}d ago, {response_rate:.0%} response rate.")
-
-    elif days_ago > 180:
-        s2 = (f"Last active {days_ago}d ago ({response_rate:.0%} response rate) — "
-              f"low platform engagement raises reachability concerns.")
-
-    elif resp_time_hrs >= 0 and resp_time_hrs <= 4:
-        s2 = (f"Responds within {resp_time_hrs:.0f}h on average "
-              f"({response_rate:.0%} response rate) — strong engagement signal.")
-
-    elif saves >= 5:
-        s2 = (f"Saved by {saves} recruiters in last 30 days — crowd-validated interest. "
-              f"Location: {location}, {relocate_str}.")
-
-    elif sal_min > SALARY_TARGET_MAX * 1.3:
-        s2 = (f"Expected salary (min {sal_min:.0f} LPA) likely above Series A budget — "
-              f"offer negotiation risk.")
-
-    elif sal_max < SALARY_TARGET_MIN * 0.7:
-        s2 = (f"Expected range ({sal_min:.0f}–{sal_max:.0f} LPA) below market rate for this seniority.")
-
-    elif edu_tier == "tier_1":
-        s2 = (f"Tier-1 institution background — marginal tiebreaker. "
-              f"Location: {location}, {relocate_str}. Notice: {notice_days}d.")
-
+        traj_str = f"short avg tenure ({avg_tenure:.0f}mo/role — possible title-chasing)"
+    elif trajectory_up:
+        traj_str = "upward trajectory"
     else:
-        active_str = "recently" if days_ago <= 30 else f"{days_ago}d ago"
-        s2 = (f"Last active {active_str}, {response_rate:.0%} response rate, {notice_days}d notice. "
-              f"Location: {location}, {relocate_str}.")
+        traj_str = None
+
+    # ── TOP 10: lead with what's good, notice/logistics secondary ────────────
+    if rank <= 10:
+        if has_ml and yrs_since_ml <= 1:
+            ml_ctx = "currently in production ML"
+        elif has_ml and yrs_since_ml <= 2:
+            ml_ctx = f"production ML {yrs_since_ml:.1f}y ago"
+        elif has_ml:
+            ml_ctx = f"ML background ({yrs_since_ml:.1f}y since last ML role)"
+        else:
+            ml_ctx = "product-company background"
+
+        disq_note = " Narrative flags non-ownership of deployment." if has_disqualifying_lang else ""
+        ghost_note = f" {n_ghost} ghost skills flagged." if is_ghost else ""
+
+        s1 = f"{title}, {yoe:.1f}y exp at {company_str} — {ml_ctx}.{skills_str}{disq_note}{ghost_note}"
+
+        logistics = []
+        if is_primary_city:
+            logistics.append(f"based in {location} (office city)")
+        else:
+            logistics.append(loc_ctx)
+        if notice_days <= 30:
+            logistics.append(notice_str)
+        else:
+            logistics.append(notice_str)
+        if traj_str:
+            logistics.append(traj_str)
+        s2 = ", ".join(logistics).capitalize() + "."
+        return f"{s1} {s2}"
+
+    # ── MID RANGE (11–50): lead with dominant signal, flag the main friction ──
+    if rank <= 50:
+        # Determine what the main positive is
+        if has_disqualifying_lang:
+            s1 = f"{title} ({yoe:.1f}y, {company_str}) — narrative states deployment was handled by another team.{skills_str}"
+            flags = []
+            if notice_days > 60:
+                flags.append(notice_str)
+            if not is_india:
+                flags.append(f"abroad ({loc_ctx})")
+            elif not is_primary_city and not willing_relocate:
+                flags.append(f"{loc_ctx}")
+            s2 = ("Flags: " + ", ".join(flags) + ".") if flags else f"{loc_ctx}, {notice_str}."
+        elif has_ml and yrs_since_ml <= 1:
+            s1 = f"{title}, {yoe:.1f}y — active production ML at {company_str}.{skills_str}"
+            frictions = []
+            if notice_days > 60:
+                frictions.append(notice_str)
+            if not is_primary_city and not willing_relocate:
+                frictions.append(f"{loc_ctx}")
+            elif not is_primary_city:
+                frictions.append(loc_ctx)
+            if n_it >= 1:
+                frictions.append(f"{n_it} IT-services role(s)")
+            s2 = (", ".join(frictions) + ".").capitalize() if frictions else f"{loc_ctx}, {notice_str}."
+        elif has_ml and yrs_since_ml <= 3:
+            s1 = f"{title}, {yoe:.1f}y — last ML role {yrs_since_ml:.1f}y ago at {company_str}, recency gap is a concern.{skills_str}"
+            s2 = f"{loc_ctx}, {notice_str}."
+        else:
+            s1 = f"{title}, {yoe:.1f}y at {company_str} — {'product-company background' if has_product else 'no ML/product background detected'}.{skills_str}"
+            s2 = f"{loc_ctx}, {notice_str}."
+        return f"{s1} {s2}"
+
+    # ── TAIL (51–100): honest about friction, brief on positives ─────────────
+    if has_disqualifying_lang:
+        s1 = f"{title} ({yoe:.1f}y) — narrative explicitly states production deployment owned by a separate team.{skills_str}"
+        flags = []
+        if notice_days > 90:
+            flags.append(notice_str)
+        if not is_india:
+            flags.append(f"abroad ({loc_ctx})")
+        elif not is_primary_city and not willing_relocate:
+            flags.append(f"{loc_ctx}")
+        if n_ghost >= 3:
+            flags.append(f"{n_ghost} ghost skills")
+        s2 = ("Additional flags: " + ", ".join(flags) + ".") if flags else f"{loc_ctx}, {notice_str}."
+    elif has_ml:
+        s1 = f"{title}, {yoe:.1f}y at {company_str} — ML background, {yrs_since_ml:.1f}y since last active ML role.{skills_str}"
+        s2 = f"{loc_ctx}, {notice_str}."
+    else:
+        s1 = f"{title}, {yoe:.1f}y at {company_str} — no production ML detected in career narrative.{skills_str}"
+        s2 = f"{loc_ctx}, {notice_str}."
 
     return f"{s1} {s2}"

@@ -36,6 +36,7 @@ def compute_structural_score(
     has_disqualifying_language: bool = False,
     is_ghost_skill_candidate: bool = False,
     is_cv_speech_no_nlp: bool = False,
+    notice_period_days: int = 0,
 ) -> float:
     """
     Weighted structural score. Clamped to [0.0, 1.0].
@@ -49,16 +50,21 @@ def compute_structural_score(
       trajectory_score 0.05
       salary_fit       0.02
 
-    Penalties applied after weighted sum:
-      narrative_zero   −0.06  (narrative_embedding_score == 0.0)
-      disqualifying    −0.12  (has_disqualifying_language)
-      ghost_skill      −0.25  (is_ghost_skill_candidate)
-      cv_speech        −0.20  (is_cv_speech_no_nlp)
+    Multiplier penalties applied after weighted sum (stack multiplicatively):
+      narrative_zero      ×0.85  (narrative_embedding_score == 0.0)
+      disqualifying       ×0.30  (has_disqualifying_language)
+      ghost_skill         ×0.45  (is_ghost_skill_candidate)
+      cv_speech           ×0.55  (is_cv_speech_no_nlp)
+      notice 61–90d       ×0.98  — light tiebreaker (was ×0.88; softened, see inline note)
+      notice 91–120d      ×0.95  — light tiebreaker (was ×0.75; softened, see inline note)
+      notice >120d        ×0.90  — light tiebreaker (was ×0.60; softened, see inline note)
+
+    Additive penalties after weighted sum (before multipliers):
       it_services      −0.02 / −0.04 / −0.06  (graduated by count)
       job_hop          −0.05 / −0.02           (graduated by years/role)
 
     Hard ceiling: when is_ghost_skill_candidate AND narrative_embedding_score == 0.0,
-      score is capped at 0.30 after all penalties.
+      score is capped at 0.20 after all penalties.
     """
     narrative_score = compute_narrative_score(narrative_embedding_score)
 
@@ -83,27 +89,65 @@ def compute_structural_score(
     elif job_hop_score < 2.5: hop_penalty = -0.02
     else:                     hop_penalty = 0.0
 
-    # Narrative / disqualifying penalties
-    # narrative_zero at -0.06: avoids double-dipping with disqualifying_penalty;
-    # the 0.35-weight narrative_score = 0.0 already captures the bulk of the signal.
-    narrative_zero_penalty = -0.06 if narrative_embedding_score == 0.0 else 0.0
-    # disqualifying at -0.12: reduced from -0.18 to prevent collapsing all flagged
-    # candidates to the same floor, which was destroying differentiation from retrieval.
-    disqualifying_penalty  = -0.12 if has_disqualifying_language else 0.0
-    ghost_penalty          = -0.25 if is_ghost_skill_candidate else 0.0
-    cv_speech_penalty      = -0.20 if is_cv_speech_no_nlp else 0.0
+    # Narrative / disqualifying penalties — load-bearing multipliers, not cosmetic deductions.
+    # Flat deductions collapsed everyone to the same floor; multipliers preserve relative
+    # ordering within the penalised group while making the penalty actually matter.
+    #
+    # narrative_zero: ×0.85 — zero narrative evidence is already captured by
+    #   narrative_score = 0.0 (contributing 0 to the 0.35-weighted term). This
+    #   small additional multiplier discourages near-zero narrative further.
+    # disqualifying: ×0.30 — explicit non-ownership admission is near-disqualifying
+    #   per the JD. Was -0.12 flat, then ×0.50. At ×0.50 + the OLD prelim fusion
+    #   weight (0.53), a keyword/semantic-strong candidate with this flag could
+    #   still rank #1 (observed in submission_v15: CAND_0004402, CAND_0043860).
+    #   Tightened to ×0.30 so the penalty holds even after PRELIM_STRUCTURAL_WEIGHT
+    #   was raised — this is now the primary defense against keyword-stuffed
+    #   profiles with a non-ownership admission; the rank.py hard-zero gate
+    #   (narrative_embedding_score < 0.667) is the backstop for clear-cut cases.
+    # ghost_skill: ×0.45 — 3+ JD skills with no narrative support is keyword stuffing.
+    # cv_speech: ×0.55 — CV/speech-without-NLP is an explicit JD "do NOT want".
+
+    penalty_multiplier = 1.0
+    if narrative_embedding_score == 0.0:
+        penalty_multiplier *= 0.85
+    if has_disqualifying_language:
+        penalty_multiplier *= 0.30
+    if is_ghost_skill_candidate:
+        penalty_multiplier *= 0.45
+    if is_cv_speech_no_nlp:
+        penalty_multiplier *= 0.55
+
+    # Notice period structural penalty — JD: "bar gets higher" beyond 30 days.
+    # SOFTENED — this was double-penalising notice period: it's already a
+    # 0.18-weighted sub-score inside compute_availability_score, and this
+    # multiplier stacked a SECOND penalty on top of the entire structural score
+    # (which carries narrative/company/experience fit — the signals that should
+    # dominate per "skills/fit > notice > location"). Empirically, notice period
+    # barely separated good candidates in this pool (most strong matches sit in
+    # the 60-120 day range simply because few people have <30-day notice), so a
+    # ×0.60–0.75 multiplier here was punishing fit-strength candidates for a
+    # weak, low-information signal. Reduced to a light tiebreaker rather than a
+    # second hard penalty; availability's notice sub-score still carries the
+    # bulk of notice's influence.
+    if notice_period_days > 120:
+        penalty_multiplier *= 0.90
+    elif notice_period_days > 90:
+        penalty_multiplier *= 0.95
+    elif notice_period_days > 60:
+        penalty_multiplier *= 0.98
 
     bonuses = skill_assessment_bonus + edu_bonus + industry_bonus + github_bonus
 
-    score = min(1.0, max(0.0,
+    base = min(1.0, max(0.0,
         raw + bonuses + it_penalty + hop_penalty
-        + narrative_zero_penalty + disqualifying_penalty
-        + ghost_penalty + cv_speech_penalty
     ))
+
+    # Apply multiplier penalties — load-bearing, not cosmetic
+    score = min(1.0, max(0.0, base * penalty_multiplier))
 
     # Hard ceiling: ghost-skill candidate with no narrative evidence
     if is_ghost_skill_candidate and narrative_embedding_score == 0.0:
-        score = min(score, 0.30)
+        score = min(score, 0.20)   # tightened from 0.30
 
     return score
 
