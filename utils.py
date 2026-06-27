@@ -27,66 +27,111 @@ Two reasons:
      run, or fusion/cross-encoder scores will be computed against stale text.
 """
 
+# JD_Narrative_Keywords used to detect whether career descriptions signal
+# JD-required technical depth. Mirrors the categories in narrative_embedding_score
+# (R1) but used here for the [narrative_signal: low] retrieval hint only.
+_JD_NARRATIVE_KEYWORDS = {
+    "embedding", "vector", "vector database", "faiss", "pinecone",
+    "weaviate", "qdrant", "milvus", "elasticsearch", "opensearch",
+    "retrieval", "semantic search", "hybrid search", "hybrid retrieval",
+    "dense retrieval", "ndcg", "mrr", "map", "a/b test",
+    "evaluation framework", "learning to rank", "reranker",
+    "information retrieval",
+}
+
 
 def build_candidate_text(c: dict) -> str:
     """
     Build the semantic text representation of a candidate for embedding + BM25.
 
+    Structure (R6):
+      1. [narrative_signal: low] tag — prepended if fewer than 3 career
+         descriptions contain any JD_Narrative_Keyword. Gives BM25 and the
+         cross-encoder a quality hint without excluding the candidate entirely.
+      2. Core identity (headline, summary)
+      3. [career narrative] block — role descriptions only, recent 2 repeated
+      4. [skills] block — skills with duration_months > 0 only (zero-duration
+         skills are suppressed as unverified / honeypot signals)
+      5. Certifications
+      6. Education
+
     Design choices:
-    - Skills include proficiency level and duration ("Python (expert, 60mo)")
-      so the embedding captures not just skill presence but seniority depth.
-    - Recent roles (first 2) are repeated to weight them more heavily in the
-      averaged embedding — a crude but effective trick with mean-pooled models.
-    - All skills included (not just top 10) — the embedding handles the long tail.
-    - Certifications included — direct signal for named ML/cloud tools.
-    - Career history capped at 5 roles — older roles add noise, not signal.
+      - Narrative-first layout ensures BM25 and CE score on what candidates
+        actually did, not what they claim to know.
+      - Zero-duration skills suppressed — they are honeypot signals or
+        unverified self-reported entries.
+      - [narrative_signal: low] tag gives the cross-encoder a quality hint
+        without removing the candidate from retrieval entirely (skills section
+        retained as recall signal per R6.6).
+      - Recent roles (first 2) repeated for embedding up-weighting (unchanged).
+      - [career narrative] header emitted once at section level; not repeated
+        with individual role descriptions.
+
+    ⚠️  Changing this function invalidates precomputed/candidate_embeddings.npy
+    and precomputed/candidate_texts.pkl. Re-run scripts/02_embed_candidates.py
+    before the next rank.py run.
     """
     parts = []
     p = c["profile"]
+    career = c.get("career_history", [])
+
+    # Determine narrative signal quality (R6.3)
+    narrative_keyword_hits = sum(
+        1 for role in career
+        if any(kw in (role.get("description") or "").lower()
+               for kw in _JD_NARRATIVE_KEYWORDS)
+    )
+    if narrative_keyword_hits < 3:
+        parts.append("[narrative_signal: low]")
 
     # Core identity
     parts.append(p.get("headline", ""))
     parts.append(p.get("summary", ""))
 
-    # Career history: weight recent roles by repeating descriptions twice
-    career = c.get("career_history", [])
+    # [career narrative] block (R6.1, R6.4)
+    # [career narrative] emitted once at section level only
+    parts.append("[career narrative]")
     for i, role in enumerate(career[:5]):
-        role_text = f"{role.get('title', '')} at {role.get('company', '')}: {role.get('description', '')}"
+        role_text = (f"{role.get('title', '')} at {role.get('company', '')}: "
+                     f"{role.get('description', '')}")
         parts.append(role_text)
         if i < 2:
-            parts.append(role_text)  # repeat 2 most recent roles to up-weight them
+            parts.append(role_text)  # repeat 2 most recent roles for up-weighting
 
-    # Skills: sort by proficiency first, then endorsements
+    # [skills] block — zero-duration skills suppressed (R6.2, R6.6)
+    parts.append("[skills]")
     PROFICIENCY_ORDER = {"expert": 4, "advanced": 3, "intermediate": 2, "beginner": 1}
     skills = sorted(
         c.get("skills", []),
         key=lambda s: (
             PROFICIENCY_ORDER.get(s.get("proficiency", ""), 0),
-            s.get("endorsements", 0)
+            s.get("endorsements", 0),
         ),
         reverse=True,
     )
     skill_parts = []
     for s in skills:
+        dur = s.get("duration_months", 0) or 0
+        if dur == 0:
+            continue   # suppress zero-duration skills (R6.2)
         name = s.get("name", "")
         prof = s.get("proficiency", "")
-        dur = s.get("duration_months", 0) or 0
         skill_parts.append(f"{name} ({prof}, {dur}mo)")
     if skill_parts:
         parts.append("Skills: " + ", ".join(skill_parts))
 
-    # Certifications (directly relevant when they name ML/cloud tools)
+    # Certifications
     certs = c.get("certifications", [])
     if certs:
         cert_names = [cert.get("name", "") for cert in certs[:5] if cert.get("name")]
         if cert_names:
             parts.append("Certifications: " + ", ".join(cert_names))
 
-    # Education: field of study and institution
+    # Education
     edu = c.get("education", [])
     if edu:
         field = edu[0].get("field_of_study", "")
-        inst = edu[0].get("institution", "")
+        inst  = edu[0].get("institution", "")
         if field or inst:
             parts.append(f"Education: {field} at {inst}")
 
