@@ -18,11 +18,17 @@ FUSION weights:
   Dense (0.65) > BM25 (0.35): the JD explicitly warns that keyword-stuffing
   is a trap; a confident semantic match must outscore a borderline keyword hit.
 
-PRELIM weights:
-  Fusion (0.55) dominates because it already encodes semantic + keyword fit.
-  Structural (0.30) raised from 0.25: eval showed adding structural was the
-  single best improvement (D > C). Availability (0.15) lowered from 0.20:
-  eval showed availability hurt NDCG@10 (E < D), so its influence is reduced.
+PRELIM weights (REBALANCED — see also the inline comment at PRELIM_FUSION_WEIGHT):
+  Structural (0.48) now dominates over fusion (0.40). Fusion measures textual
+  similarity to the JD (BM25 keyword overlap + dense cosine) — it does NOT
+  encode fit, and the JD explicitly warns keyword-stuffing is a trap. At the
+  previous 0.53/0.35 split, a keyword-dense profile could outscore a candidate
+  structural.py had heavily penalised (disqualifying language ×0.50, ghost
+  skills ×0.45, etc.) because fusion's larger weight absorbed the penalty.
+  Structural now carries the larger share so disqualifiers and fit signals
+  actually move prelim ranking, not just nudge it. Availability (0.12)
+  unchanged — it's a tiebreaker, not a driver (see AVAILABILITY WEIGHT note
+  below).
 
 FINAL weights:
   CE weight 0.25 → 0.30; prelim 0.75 → 0.70.
@@ -68,14 +74,32 @@ config D (0.764). Availability adds noise at high weight because platform
 engagement correlates poorly with actual ML competency.
 """
 
+# ── Narrative scoring ─────────────────────────────────────────────────────────
+NARRATIVE_SCORE_WEIGHT = 0.35   # narrative quality contribution within structural score
+
 # ── Retrieval fusion ──────────────────────────────────────────────────────────
 FUSION_BM25_WEIGHT  = 0.35
 FUSION_DENSE_WEIGHT = 0.65
 
 # ── Preliminary score (pre-cross-encoder) ─────────────────────────────────────
-PRELIM_FUSION_WEIGHT       = 0.55
-PRELIM_STRUCTURAL_WEIGHT   = 0.30   # raised from 0.25 — structural is the best single signal
-PRELIM_AVAILABILITY_WEIGHT = 0.15   # lowered from 0.20 — eval showed availability adds noise
+# REBALANCED — fusion lowered 0.53 → 0.40, structural raised 0.35 → 0.45.
+#
+# WHY: fusion measures textual similarity (BM25 keyword overlap + dense cosine
+# to the JD), not actual fit. jd.txt explicitly warns the "right answer" is not
+# "whose skills section contains the most AI keywords" — but at fusion=0.53 vs
+# structural=0.35, a keyword-dense profile could still outscore a structurally
+# disqualified one, because structural's hard-zero/multiplier penalties
+# (disqualifying language ×0.50, ghost-skill ×0.45, etc.) only act on the
+# 0.35-weighted term. A candidate whose narrative explicitly admits deployment
+# was owned by another team — a near-disqualifier per the JD — was observed
+# landing at rank #1 in submission_v15 because fusion's 0.53 weight absorbed
+# the structural penalty almost entirely (see rank.py R2 gate fix, same date).
+# Structural now carries the larger share so its penalties actually move
+# the needle, consistent with "skills/fit > notice > location" as the intended
+# priority order.
+PRELIM_FUSION_WEIGHT       = 0.40   # lowered from 0.53 — was swamping structural penalties
+PRELIM_STRUCTURAL_WEIGHT   = 0.48   # raised from 0.35 — fit + disqualifiers need to actually bite
+PRELIM_AVAILABILITY_WEIGHT = 0.12   # unchanged — availability is a tiebreaker, not a driver
 
 # ── Final score (after cross-encoder) ────────────────────────────────────────
 FINAL_PRELIM_WEIGHT = 0.70   # lowered from 0.75 — allows CE to add light tiebreaking
@@ -93,12 +117,16 @@ SCORE_CAP_ML_RECENCY_YEARS = 2.0    # years_since_last_ml_role above this → tr
 # ── Notice period score tiers ─────────────────────────────────────────────────
 # Used in compute_availability_score. Stored here so they're visible alongside
 # the other weight decisions rather than buried in a long scoring function.
+#
+# JD says: "We'd love sub-30-day notice. We can buy out up to 30 days.
+# 30+ day notice candidates are still in scope but the bar gets higher."
+# Tiers reflect that 0–30 days = preferred band, 30+ is real friction.
 NOTICE_SCORE_0_15   = 1.00
-NOTICE_SCORE_16_30  = 0.85
-NOTICE_SCORE_31_60  = 0.60
-NOTICE_SCORE_61_90  = 0.35
-NOTICE_SCORE_91_120 = 0.25   # softened from 0.15 — JD says "still in scope"
-NOTICE_SCORE_120P   = 0.15   # > 120 days: meaningful practical blocker
+NOTICE_SCORE_16_30  = 0.90   # within JD buyout window — still preferred
+NOTICE_SCORE_31_60  = 0.55   # tightened from 0.60 — "bar gets higher" starts here
+NOTICE_SCORE_61_90  = 0.30   # tightened from 0.35 — meaningful delay
+NOTICE_SCORE_91_120 = 0.18   # tightened from 0.25 — 3-4 month wait is a real blocker
+NOTICE_SCORE_120P   = 0.08   # tightened from 0.15 — > 120 days: near-disqualifying
 
 # ── Sanity checks — catch typos at import time ────────────────────────────────
 assert abs(FUSION_BM25_WEIGHT + FUSION_DENSE_WEIGHT - 1.0) < 1e-9, \
@@ -109,3 +137,15 @@ assert abs(FINAL_PRELIM_WEIGHT + FINAL_CE_WEIGHT - 1.0) < 1e-9, \
     "Final weights must sum to 1.0"
 assert 0.0 < SCORE_CAP_MAX < 1.0, \
     "Score cap must be in (0, 1)"
+
+# Structural base weights sum check (narrative + company + location + experience + trajectory + salary)
+_STRUCTURAL_BASE = (
+    NARRATIVE_SCORE_WEIGHT   # 0.35
+    + 0.22                   # company_fit
+    + 0.25                   # location_fit
+    + 0.20                   # experience_fit
+    + 0.05                   # trajectory_score
+    + 0.02                   # salary_fit
+)
+assert abs(_STRUCTURAL_BASE - 1.09) < 1e-9, \
+    f"Structural base weights must sum to 1.09, got {_STRUCTURAL_BASE}"

@@ -10,7 +10,7 @@ circular imports (scoring.py → pipeline/fusion.py → scoring.py was the old c
 from config.locations import TARGET_CITIES, PRIMARY_CITIES, TIER_1, TIER_2, TIER_3
 from config.companies import IT_SERVICES_COMPANIES
 from config.keywords import (
-    JD_RELEVANT_SKILLS,
+    SKILL_ASSESSMENT_JD_RELEVANT,
     RESEARCH_ONLY_COMPANY_INDICATORS,
     RESEARCH_ONLY_TITLE_INDICATORS,
     INDUSTRY_RELEVANT_KEYWORDS,
@@ -50,7 +50,7 @@ __all__ = [
     # companies
     "IT_SERVICES_COMPANIES",
     # keywords
-    "JD_RELEVANT_SKILLS",
+    "SKILL_ASSESSMENT_JD_RELEVANT",
     "RESEARCH_ONLY_COMPANY_INDICATORS",
     "RESEARCH_ONLY_TITLE_INDICATORS",
     "INDUSTRY_RELEVANT_KEYWORDS",
