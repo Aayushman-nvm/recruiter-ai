@@ -7,7 +7,7 @@ All are pure functions with no side effects.
 
 from datetime import date
 
-from config.locations import TARGET_CITIES, PRIMARY_CITIES
+from config.locations import TARGET_CITIES, PRIMARY_CITIES, TIER_1
 from config.keywords  import SKILL_ASSESSMENT_JD_RELEVANT, INDUSTRY_RELEVANT_KEYWORDS
 from config.salary    import SALARY_TARGET_MIN, SALARY_TARGET_MAX
 from config.weights   import (
@@ -24,17 +24,17 @@ def compute_experience_fit(years: float) -> float:
       9–12 yrs:  0.82 — slightly over, but JD says "still consider if signals strong"
       4–5 yrs:   0.75 — just below band, small but real gap
       12–15 yrs: 0.65
-      3–4 yrs:   0.55 — meaningful under-experience
+      3–4 yrs:   0.40 — tightened: JD is explicit about 5-9, sub-4yr is a real gap
       >15 yrs:   0.40 — JD flags hands-on coding risk at this tenure
-      <3 yrs:    0.25
+      <3 yrs:    0.15 — tightened: near-disqualifying under-experience
     """
     if 5 <= years <= 9:    return 1.0
     elif 9 < years <= 12:  return 0.82
     elif 4 <= years < 5:   return 0.75
     elif 12 < years <= 15: return 0.65
-    elif 3 <= years < 4:   return 0.55
+    elif 3 <= years < 4:   return 0.40
     elif years > 15:       return 0.40
-    else:                  return 0.25
+    else:                  return 0.15
 
 
 def compute_narrative_score(narrative_embedding_score: float) -> float:
@@ -64,23 +64,32 @@ def compute_location_fit(
     is_target_city: bool,
     willing_to_relocate: bool,
     is_primary_city: bool = False,
+    is_tier_1_city: bool = False,
 ) -> float:
     """
-    Score location fit against Noida/Pune-preferred JD.
+    Score location fit per JD: "Pune/Noida-preferred. Open to relocation
+    candidates from Tier-1 Indian cities. Flexible cadence."
 
-      Primary city (Pune/Noida): 1.00
-      JD-welcomed India city:    0.88
-      India, willing to relocate: 0.78
-      India, other city:         0.52
-      Abroad, willing to relocate: 0.55
-      Abroad, not willing:       0.15
+    PRIMARY (Pune/Noida): 1.00 — hybrid role, they're in the same city;
+      relocation flag is irrelevant (even "not willing" is fine — they're
+      already there and can visit office when needed).
+    TIER-1 India + willing to relocate: 0.85 — JD explicitly welcomes these.
+    TIER-1 India + NOT willing to relocate: 0.20 — JD says "open to relocation
+      candidates from Tier-1" which implies willingness is required outside primary.
+      Not willing + not primary = meaningful friction, near-disqualifying.
+    Non-Tier-1 India + willing to relocate: 0.72 — raised from 0.65; a willing
+      non-Tier-1 candidate is a better hire than a Tier-1 who won't relocate.
+    Non-Tier-1 India + NOT willing: 0.25 — poor fit, will never visit office.
+    Abroad + willing: 0.45 — case-by-case, no visa sponsorship.
+    Abroad + NOT willing: 0.08 — near-disqualifying.
     """
     if not is_india_based:
-        return 0.55 if willing_to_relocate else 0.15
-    if is_primary_city:      return 1.0
-    if is_target_city:       return 0.88
-    if willing_to_relocate:  return 0.78
-    return 0.52
+        return 0.45 if willing_to_relocate else 0.08
+    if is_primary_city:
+        return 1.0   # relocation flag irrelevant — they live in the city
+    if is_tier_1_city:
+        return 0.85 if willing_to_relocate else 0.20
+    return 0.72 if willing_to_relocate else 0.25
 
 
 def compute_company_fit(
