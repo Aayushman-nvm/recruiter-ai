@@ -2,8 +2,8 @@
 scripts/inspect_top100.py — Dump raw candidate data for top-100 submission entries.
 
 Usage:
-  python scripts/inspect_top100.py --submission test_submissions/submission_11.csv
-  python scripts/inspect_top100.py --submission test_submissions/submission_11.csv --out-dir bin/inspection_sub11
+  python scripts/inspect_top100.py --submission test_submissions/submission.csv
+  python scripts/inspect_top100.py --submission test_submissions/submission.csv --out-dir bin/inspection_sub
 
 Output:
   bin/inspection/<submission_name>/
@@ -138,8 +138,8 @@ def main():
     out_dir = Path(args.out_dir) if args.out_dir else (
         ROOT / "bin" / f"inspection_{submission_path.stem}"
     )
-    candidates_dir = out_dir / "candidates"
-    candidates_dir.mkdir(parents=True, exist_ok=True)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Load submission ───────────────────────────────────────────────────────
     entries = load_submission(str(submission_path))
@@ -209,7 +209,7 @@ def main():
 
     print(f"\nDone. Open {out_dir} to inspect:")
     print("  00_summary.csv              — all 100 candidates, key fields")
-    print("  candidates/001_CAND_*.json  — full raw profile for rank 1, etc.")
+    print("  all_candidates.json  — full raw profiles of 100 candidates.")
     print("\n⚠️  SUBMISSION WARNING: bin/ is development only — not for submission.")
 
 
