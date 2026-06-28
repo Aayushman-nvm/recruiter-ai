@@ -1,14 +1,78 @@
-team_name: Redrob Ranker
-model_type: hybrid_retrieval_pipeline
-encoder: BAAI/bge-base-en-v1.5
-reranker: cross-encoder/ms-marco-MiniLM-L-6-v2
-retrieval_methods:
-  - BM25
-  - dense_cosine_similarity
-  - reciprocal_rank_fusion
-scoring_stages: 4
-max_runtime_minutes: 5
-cpu_only: true
-requires_gpu: false
-reasoning_model: phi3:mini
-reasoning_via_ollama: true
+# ============================================================================
+# Team identity
+# ============================================================================
+team_name: "White"
+
+primary_contact:
+  name: "Aayushman Jha"
+  email: "aayushman.jha001@gmail.com"
+  phone: "+91-7411106974"
+
+team_members:
+  - name: "Aayushman Jha"
+    email: "aayushman.jha001@gmail.com"
+    role: "Lead / Solo participant"
+
+# ============================================================================
+# Code and reproducibility
+# ============================================================================
+github_repo: "https://github.com/Aayushman-nvm/recruiter-ai"
+
+sandbox_link: "https://recruiter-ai-dvte5vvf87xkr5qffqlpzg.streamlit.app/"
+# Required. A working hosted environment where the ranker can be run on a small
+# candidate sample. See Section 10.5 of submission_spec.md for acceptable
+# platforms (HuggingFace Spaces, Streamlit Cloud, Replit, Colab, Docker, Binder).
+
+reproduce_command: "python rank.py --out submission.csv"
+
+# ============================================================================
+# Compute environment
+# ============================================================================
+compute:
+  platform: "HP 15s"                    
+  cpu_cores: 2                                  
+  ram_gb: 8                                    
+  python_version: "3.10.10"                      
+  os: "Windows 11 Home (64-bit)"                              
+  uses_gpu_for_inference: false                 
+  has_network_during_ranking: false             
+  pre_computation_required: true                
+  pre_computation_time_minutes: 1080            
+
+# ============================================================================
+# AI tools declaration
+# ============================================================================
+ai_tools_used:
+  - "Claude"
+  - "Kiro"
+  - "ChatGPT"
+
+ai_usage_summary: |
+  - "Used Claude for doubt clarification and advice on the approach, and Kiro IDE for autocomplete and development."
+  - "Used ChatGPT to debug Python issues and understand the data flow as the project grew."
+
+# ============================================================================
+# Approach summary (optional but recommended)
+# ============================================================================
+methodology_summary: |
+  "My approach is a multi-stage candidate ranking pipeline that combines lexical search, semantic retrieval,
+  structured feature scoring, and neural reranking to identify the best candidates from a pool of 100,000 profiles.
+  Instead of training a custom model, the system leverages pre-trained embedding and cross-encoder models alongside
+  domain-specific scoring functions to deliver accurate, explainable, and reproducible rankings.
+  Computationally intensive tasks such as feature extraction, embedding generation, and reasoning generation are performed offline,
+  allowing the final ranking process to run within the required CPU, memory, and time constraints.
+  During ranking, BM25 and dense embeddings retrieve the most relevant candidates, Reciprocal Rank Fusion merges both retrieval signals,
+  structured scoring evaluates factors such as experience, company background, skills, salary alignment, and availability,
+  and a cross-encoder reranks the shortlisted candidates for maximum precision.
+  Hard eligibility filters eliminate unsuitable profiles, while deterministic scoring and generated reasoning ensure transparent,
+  recruiter-friendly results that scale efficiently for large hiring datasets."
+
+# ============================================================================
+# Declarations
+# ============================================================================
+declarations:
+  read_submission_spec: true        # I have read submission_spec.md in full
+  code_is_original_work: true       # My code is my team's original work (using AI as a tool is fine)
+  no_collusion: true                # I have not coordinated my submission with other teams
+  honeypot_check_done: false        # OPTIONAL — set true if you explicitly checked for honeypots in your ranking
+  reproduction_tested: true         # I have tested that my reproduce_command runs end-to-end
