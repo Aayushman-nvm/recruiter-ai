@@ -10,21 +10,29 @@ def compute_experience_fit(years: float) -> float:
     """
     Score experience match. Sweet spot: 5–9 years (JD explicit band).
 
+    JD note: "5-9 is a range, not a requirement. Some people hit senior
+    judgment at 4 years; some never after 15." But the disqualifiers are
+    clear — research-only and shallow-API candidates are zeroed elsewhere,
+    so this purely gates on years.
+
       5–9 yrs:   1.00 — ideal band
-      9–12 yrs:  0.82 — slightly over, but JD says "still consider if signals strong"
-      4–5 yrs:   0.75 — just below band, small but real gap
-      12–15 yrs: 0.65
-      3–4 yrs:   0.40 — tightened: JD is explicit about 5-9, sub-4yr is a real gap
-      >15 yrs:   0.40 — JD flags hands-on coding risk at this tenure
-      <3 yrs:    0.15 — tightened: near-disqualifying under-experience
+      4–5 yrs:   0.78 — just below; JD says "still consider if signals strong"
+      9–11 yrs:  0.80 — slightly over, manageable
+      11–13 yrs: 0.62 — getting senior; hands-on coding concern rises
+      3–4 yrs:   0.45 — real gap; JD expects production experience takes time
+      13–16 yrs: 0.45 — architecture/tech-lead risk is real at this tenure
+      >16 yrs:   0.25 — JD is explicit: "haven't written production code in 18mo"
+                        is a disqualifier; very long careers have high risk of this
+      <3 yrs:    0.10 — near-disqualifying
     """
-    if 5 <= years <= 9:    return 1.0
-    elif 9 < years <= 12:  return 0.82
-    elif 4 <= years < 5:   return 0.75
-    elif 12 < years <= 15: return 0.65
-    elif 3 <= years < 4:   return 0.40
-    elif years > 15:       return 0.40
-    else:                  return 0.15
+    if 5 <= years <= 9:      return 1.0
+    elif 9 < years <= 11:    return 0.80
+    elif 4 <= years < 5:     return 0.78
+    elif 11 < years <= 13:   return 0.62
+    elif 3 <= years < 4:     return 0.45
+    elif 13 < years <= 16:   return 0.45
+    elif years > 16:         return 0.25
+    else:                    return 0.10
 
 
 def compute_narrative_score(narrative_embedding_score: float) -> float:
@@ -37,16 +45,18 @@ def compute_narrative_score(narrative_embedding_score: float) -> float:
       (b) NDCG/MRR/MAP/eval-framework keywords in narrative
       (c) has_ml_production_experience AND years_since_last_ml_role ≤ 1.0
 
-    Mapping (rescaled upward so strong-but-not-perfect candidates are rewarded,
-    not penalised for lacking one niche signal category):
-      0.0   → 0.00  (no JD signal categories evidenced — hard zero)
-      0.333 → 0.55  (one of three — raised from 0.35; has at least some narrative depth)
-      0.667 → 0.80  (two of three — raised from 0.70; solid narrative evidence)
-      1.0   → 1.00  (all three — unchanged)
+    The JD is very explicit: ghost skills are a trap. The narrative is the
+    ground truth. A zero-narrative candidate is near-disqualifying regardless
+    of their skills list — penalise hard.
+
+      0.0   → 0.00  (no JD signal categories in narrative — hard zero)
+      0.333 → 0.45  (one of three — has some relevant narrative depth)
+      0.667 → 0.78  (two of three — solid narrative evidence, good fit)
+      1.0   → 1.00  (all three — ideal: embeddings/vectorDB + eval + recent hands-on)
     """
     if narrative_embedding_score <= 0.0:   return 0.0
-    elif narrative_embedding_score <= 1/3: return 0.55
-    elif narrative_embedding_score <= 2/3: return 0.80
+    elif narrative_embedding_score <= 1/3: return 0.45
+    elif narrative_embedding_score <= 2/3: return 0.78
     else:                                  return 1.00
 
 
@@ -57,14 +67,35 @@ def compute_location_fit(
     is_primary_city: bool = False,
     is_tier_1_city: bool = False,
 ) -> float:
-    
+    """
+    Location scoring based on JD preferences.
+
+    JD: "Pune/Noida preferred. Delhi NCR, Hyderabad, Mumbai, Bengaluru,
+    Gurgaon welcome. Outside India: case-by-case, no visa sponsorship."
+
+    Primary office cities (Pune/Noida) = highest signal.
+    Other tier-1 India cities = good, willing to relocate matters.
+    Non-tier-1 India cities = weaker; relocation matters more.
+    Outside India = significant friction; relocation claim still uncertain.
+    """
     if not is_india_based:
-        return 0.45 if willing_to_relocate else 0.08
+        # Outside India: "case-by-case" means low base score.
+        # Willing-to-relocate helps but there's visa/logistical friction.
+        return 0.38 if willing_to_relocate else 0.05
+
     if is_primary_city:
-        return 1.0   # relocation flag irrelevant — they live in the city
+        return 1.0   # in Pune or Noida — ideal
+
     if is_tier_1_city:
-        return 0.85 if willing_to_relocate else 0.35
-    return 0.72 if willing_to_relocate else 0.22
+        # Major Indian city listed in JD — Delhi NCR, Hyderabad, Mumbai, Bengaluru, Gurgaon, Kolkata
+        return 0.80 if willing_to_relocate else 0.40
+
+    if is_target_city:
+        # In target city list but not tier-1 (e.g. Noida variants)
+        return 0.70 if willing_to_relocate else 0.30
+
+    # Non-target Indian city — relocation required
+    return 0.55 if willing_to_relocate else 0.18
 
 
 def compute_company_fit(
@@ -81,31 +112,40 @@ def compute_company_fit(
     Hard disqualifiers (return 0.0):
       - Entire career in IT services (JD explicit)
       - Entire career in pure research with no production deployment
+      - shallow_recent_ml_only: recent LangChain-only experience with no prior depth
 
-    shallow_recent_ml_only: recent LangChain-only experience without prior
-    depth — treated as no effective ML experience.
-
-    ML recency decay: stale ML always beats no-ML-ever (floor 0.65).
+    ML recency tiers — the JD cares deeply about CURRENT hands-on production work.
+    "Senior engineers who haven't written production code in 18+ months" is an
+    explicit disqualifier. Reflect that in the decay curve.
     """
     if entire_career_it_services or entire_career_research_only:
         return 0.0
 
-    effective_has_ml = has_ml_production_experience and not shallow_recent_ml_only
+    if shallow_recent_ml_only:
+        return 0.18   # not a hard zero but very close — one step above no-ML
 
-    if years_since_last_ml_role <= 0:   ml_recency = 1.0
-    elif years_since_last_ml_role <= 1: ml_recency = 0.85
-    elif years_since_last_ml_role <= 2: ml_recency = 0.65
-    elif years_since_last_ml_role <= 4: ml_recency = 0.40
-    else:                               ml_recency = 0.20
+    if not has_ml_production_experience:
+        return 0.30 if has_product_company_exp else 0.12
 
-    if has_product_company_exp and effective_has_ml:
+    # ML recency decay — the JD is explicit about 18-month cutoff for hands-on coding.
+    # Tighten the decay significantly vs the previous version.
+    if years_since_last_ml_role <= 0:     ml_recency = 1.0
+    elif years_since_last_ml_role <= 0.5: ml_recency = 0.95
+    elif years_since_last_ml_role <= 1.0: ml_recency = 0.85
+    elif years_since_last_ml_role <= 1.5: ml_recency = 0.68   # 18-month mark — JD disqualifier zone
+    elif years_since_last_ml_role <= 2.0: ml_recency = 0.50
+    elif years_since_last_ml_role <= 3.0: ml_recency = 0.32
+    elif years_since_last_ml_role <= 5.0: ml_recency = 0.18
+    else:                                 ml_recency = 0.08
+
+    if has_product_company_exp:
         if years_since_last_ml_role >= 99.0:
-            return 0.65
-        return max(0.65, 1.0 * ml_recency)
-    elif has_product_company_exp:
-        return 0.65
+            return 0.35   # has product exp but ML is very old
+        return max(0.35, ml_recency)
     else:
-        return 0.38
+        # No product company experience but has ML — must have done ML at IT-services
+        # or research-adjacent companies. Penalise but don't zero.
+        return max(0.18, ml_recency * 0.60)
 
 
 def compute_salary_fit(expected_min: float, expected_max: float) -> float:

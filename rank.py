@@ -293,17 +293,16 @@ def rank_candidates(
     df_top.loc[cv_no_nlp_zero, "prelim_score"] = 0.0
 
     # R6: No engineering/ML career background at all — hard zero.
-    # Catches Mechanic→Content Writer→Accountant type profiles that sneak in
-    # because their skills list contains AI keywords (RAG, LLMs, Semantic Search).
-    # `has_product_company_exp` is True for any non-IT-services company so it
-    # can't gate this; `n_ml_roles == 0` is the reliable signal: the ML keyword
-    # scanner found zero roles with actual ML evidence in the description.
-    # Also gate on narrative_embedding_score == 0.0 (no embedding/eval keywords
-    # in narrative either) to avoid false-positives on legitimate ML engineers
-    # whose role descriptions happen to use non-standard terminology.
+    # Catches HR Manager, Mechanical Engineer, Accountant type profiles that sneak
+    # in because their skills list has AI keywords (RAG, Pinecone, Semantic Search).
+    # The critical gate: n_ml_roles == 0 means the ML keyword scanner found zero roles
+    # with actual ML evidence in role descriptions. If someone spent 7+ years as
+    # an HR Manager and lists "Information Retrieval" as a skill, they are not a fit.
+    # We intentionally do NOT require narrative_embedding_score == 0.0 here because
+    # these profiles can have a non-zero narrative score if their description mentions
+    # ML tools in passing. n_ml_roles == 0 is the definitive signal.
     no_ml_roles_at_all = (
         (df_top["n_ml_roles"] == 0) &
-        (df_top["narrative_embedding_score"] == 0.0) &
         (~df_top["has_ml_production_experience"])
     )
     df_top.loc[no_ml_roles_at_all, "prelim_score"] = 0.0
@@ -372,9 +371,10 @@ def rank_candidates(
     topN.loc[cv_no_nlp_final, "final_score"] = 0.0
 
     # R6: No ML roles — same gate as prelim, applied again at final stage.
+    # Drop the narrative_embedding_score guard here too for the same reason —
+    # n_ml_roles == 0 is definitive regardless of narrative keyword presence.
     no_ml_roles_final = (
         (topN["n_ml_roles"] == 0) &
-        (topN["narrative_embedding_score"] == 0.0) &
         (~topN["has_ml_production_experience"])
     )
     topN.loc[no_ml_roles_final, "final_score"] = 0.0
