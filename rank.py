@@ -31,7 +31,6 @@ import time
 
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
 from pipeline.bm25_retrieval  import run_bm25
 from pipeline.dense_retrieval import compute_dense_scores
@@ -71,6 +70,7 @@ def load_precomputed(precomputed_dir: str):
         "has_disqualifying_language", "n_ghost_skills",
         "is_ghost_skill_candidate", "is_cv_speech_primary",
         "is_cv_speech_no_nlp", "top_jd_skills", "is_tier_1_city",
+        "is_junior_stagnant",
     ]
     missing = [col for col in REQUIRED_NEW_COLUMNS if col not in df.columns]
     if missing:
@@ -117,6 +117,8 @@ def _row_structural(row) -> float:
         bool(row.get("is_ghost_skill_candidate", False)),           # is_ghost_skill_candidate
         bool(row.get("is_cv_speech_no_nlp", False)),                # is_cv_speech_no_nlp
         int(row.get("notice_period_days", 0) or 0),                 # notice_period_days
+        float(row.get("recruiter_response_rate", 0.5) or 0.5),      # recruiter_response_rate
+        bool(row.get("is_junior_stagnant", False)),                  # is_junior_stagnant
     )
 
 
@@ -251,10 +253,10 @@ def rank_candidates(
     # ── Stage 3: Structural + availability ───────────────────────────────────
     print("Stage 3: Structural + availability scoring...")
     t3 = time.time()
-    tqdm.pandas(desc="Structural")
-    df_top["structural_score"]   = df_top.progress_apply(_row_structural,   axis=1)
-    tqdm.pandas(desc="Availability")
-    df_top["availability_score"] = df_top.progress_apply(_row_availability, axis=1)
+    # plain apply — tqdm.pandas adds ~30-40s overhead on 5000 rows via its
+    # per-row Python callback. Progress is visible from the stage timing print.
+    df_top["structural_score"]   = df_top.apply(_row_structural,   axis=1)
+    df_top["availability_score"] = df_top.apply(_row_availability, axis=1)
 
     df_top["fusion_score"]      = df_top["candidate_id"].map(fusion_scores)
     max_fusion                  = df_top["fusion_score"].max()
@@ -290,19 +292,21 @@ def rank_candidates(
     )
     df_top.loc[cv_no_nlp_zero, "prelim_score"] = 0.0
 
-    # R2: disqualifying language → zero prelim score, mirrors the final-stage
-    # gate below. Previously this gate only existed AFTER the cross-encoder,
-    # which meant disqualified candidates could still consume a CE slot that
-    # should have gone to a genuinely strong candidate (ce_topn is a hard
-    # budget — wasting slots on candidates that get zeroed anyway hurts
-    # recall for borderline-but-clean candidates just outside ce_topn).
-    # See the matching comment near `disq_zero` in the final-score block for
-    # why `narrative_embedding_score < 0.667` rather than `== 0.0` is correct.
-    disq_zero_prelim = (
-        df_top["has_disqualifying_language"] &
-        (df_top["narrative_embedding_score"] < 0.667)
+    # R6: No engineering/ML career background at all — hard zero.
+    # Catches Mechanic→Content Writer→Accountant type profiles that sneak in
+    # because their skills list contains AI keywords (RAG, LLMs, Semantic Search).
+    # `has_product_company_exp` is True for any non-IT-services company so it
+    # can't gate this; `n_ml_roles == 0` is the reliable signal: the ML keyword
+    # scanner found zero roles with actual ML evidence in the description.
+    # Also gate on narrative_embedding_score == 0.0 (no embedding/eval keywords
+    # in narrative either) to avoid false-positives on legitimate ML engineers
+    # whose role descriptions happen to use non-standard terminology.
+    no_ml_roles_at_all = (
+        (df_top["n_ml_roles"] == 0) &
+        (df_top["narrative_embedding_score"] == 0.0) &
+        (~df_top["has_ml_production_experience"])
     )
-    df_top.loc[disq_zero_prelim, "prelim_score"] = 0.0
+    df_top.loc[no_ml_roles_at_all, "prelim_score"] = 0.0
 
     t_structural = time.time() - t3
     print(f"  Structural done in {t_structural:.1f}s.")
@@ -319,7 +323,11 @@ def rank_candidates(
     topN        = df_eligible.nlargest(ce_topn, "prelim_score").copy()
     topN_ids    = topN["candidate_id"].tolist()
     cid_to_text = dict(zip(candidate_ids, candidate_texts))
-    topN_texts  = [cid_to_text[cid] for cid in topN_ids]
+    # Truncate texts to 1500 chars before CE inference — MiniLM-L6 has a 512
+    # token limit (~400 words ≈ 2000 chars) so anything beyond that is silently
+    # dropped by the tokenizer anyway. Pre-truncating avoids the Python-side
+    # cost of building and serialising large strings for zero accuracy gain.
+    topN_texts  = [cid_to_text[cid][:1500] for cid in topN_ids]
 
     ce_scores_norm   = rerank(jd_query_text, topN_ids, topN_texts)
     topN["ce_score"] = ce_scores_norm
@@ -362,6 +370,14 @@ def rank_candidates(
         (topN["narrative_embedding_score"] == 0.0)
     )
     topN.loc[cv_no_nlp_final, "final_score"] = 0.0
+
+    # R6: No ML roles — same gate as prelim, applied again at final stage.
+    no_ml_roles_final = (
+        (topN["n_ml_roles"] == 0) &
+        (topN["narrative_embedding_score"] == 0.0) &
+        (~topN["has_ml_production_experience"])
+    )
+    topN.loc[no_ml_roles_final, "final_score"] = 0.0
 
     t_ce = time.time() - t4
     print(f"  Cross-encoder done in {t_ce:.1f}s.")
