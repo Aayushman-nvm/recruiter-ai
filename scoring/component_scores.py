@@ -1,11 +1,3 @@
-"""
-scoring/component_scores.py — Individual scoring functions.
-
-Each function scores one dimension of a candidate against the JD.
-All are pure functions with no side effects.
-"""
-
-
 from config.keywords  import SKILL_ASSESSMENT_JD_RELEVANT, INDUSTRY_RELEVANT_KEYWORDS
 from config.salary    import SALARY_TARGET_MIN, SALARY_TARGET_MAX
 from config.weights   import (
@@ -45,16 +37,17 @@ def compute_narrative_score(narrative_embedding_score: float) -> float:
       (b) NDCG/MRR/MAP/eval-framework keywords in narrative
       (c) has_ml_production_experience AND years_since_last_ml_role ≤ 1.0
 
-    Mapping:
-      0.0   → 0.00  (no JD signal categories evidenced)
-      0.333 → 0.35  (one of three)
-      0.667 → 0.70  (two of three)
-      1.0   → 1.00  (all three)
+    Mapping (rescaled upward so strong-but-not-perfect candidates are rewarded,
+    not penalised for lacking one niche signal category):
+      0.0   → 0.00  (no JD signal categories evidenced — hard zero)
+      0.333 → 0.55  (one of three — raised from 0.35; has at least some narrative depth)
+      0.667 → 0.80  (two of three — raised from 0.70; solid narrative evidence)
+      1.0   → 1.00  (all three — unchanged)
     """
     if narrative_embedding_score <= 0.0:   return 0.0
-    elif narrative_embedding_score <= 1/3: return 0.35
-    elif narrative_embedding_score <= 2/3: return 0.70
-    else:                                  return 1.0
+    elif narrative_embedding_score <= 1/3: return 0.55
+    elif narrative_embedding_score <= 2/3: return 0.80
+    else:                                  return 1.00
 
 
 def compute_location_fit(
@@ -64,30 +57,14 @@ def compute_location_fit(
     is_primary_city: bool = False,
     is_tier_1_city: bool = False,
 ) -> float:
-    """
-    Score location fit per JD: "Pune/Noida-preferred. Open to relocation
-    candidates from Tier-1 Indian cities. Flexible cadence."
-
-    PRIMARY (Pune/Noida): 1.00 — hybrid role, they're in the same city;
-      relocation flag is irrelevant (even "not willing" is fine — they're
-      already there and can visit office when needed).
-    TIER-1 India + willing to relocate: 0.85 — JD explicitly welcomes these.
-    TIER-1 India + NOT willing to relocate: 0.20 — JD says "open to relocation
-      candidates from Tier-1" which implies willingness is required outside primary.
-      Not willing + not primary = meaningful friction, near-disqualifying.
-    Non-Tier-1 India + willing to relocate: 0.72 — raised from 0.65; a willing
-      non-Tier-1 candidate is a better hire than a Tier-1 who won't relocate.
-    Non-Tier-1 India + NOT willing: 0.25 — poor fit, will never visit office.
-    Abroad + willing: 0.45 — case-by-case, no visa sponsorship.
-    Abroad + NOT willing: 0.08 — near-disqualifying.
-    """
+    
     if not is_india_based:
         return 0.45 if willing_to_relocate else 0.08
     if is_primary_city:
         return 1.0   # relocation flag irrelevant — they live in the city
     if is_tier_1_city:
-        return 0.85 if willing_to_relocate else 0.20
-    return 0.72 if willing_to_relocate else 0.25
+        return 0.85 if willing_to_relocate else 0.35
+    return 0.72 if willing_to_relocate else 0.22
 
 
 def compute_company_fit(

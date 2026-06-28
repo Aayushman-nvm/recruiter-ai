@@ -46,6 +46,7 @@ def generate_reasoning(row: dict) -> str:
     n_ghost                = int(row.get("n_ghost_skills", 0) or 0)
     is_ghost               = bool(row.get("is_ghost_skill_candidate", False))
     is_cv_speech_nlp       = bool(row.get("is_cv_speech_no_nlp", False))
+    is_junior_stagnant     = bool(row.get("is_junior_stagnant", False))
     top_jd_skills          = str(row.get("top_jd_skills", "") or "").strip()
     ce_score               = float(row.get("ce_score") if row.get("ce_score") is not None else 0)
 
@@ -104,6 +105,10 @@ def generate_reasoning(row: dict) -> str:
     else:
         traj_str = None
 
+    # ── Reachability flag — JD explicitly names low response rate as disqualifying ──
+    low_response = response_rate < 0.20
+    low_response_str = f"{response_rate:.0%} response rate" if low_response else None
+
     # ── TOP 10: lead with what's good, notice/logistics secondary ────────────
     if rank <= 10:
         if has_ml and yrs_since_ml <= 1:
@@ -117,18 +122,17 @@ def generate_reasoning(row: dict) -> str:
 
         disq_note = " Narrative flags non-ownership of deployment." if has_disqualifying_lang else ""
         ghost_note = f" {n_ghost} ghost skills flagged." if is_ghost else ""
+        junior_note = f" Title stuck at junior level for {sum([1]) * int(yoe * 12):.0f}mo — no promotion detected." if is_junior_stagnant else ""
+        reach_note = f" Low response rate ({response_rate:.0%}) — reachability concern." if low_response else ""
 
-        s1 = f"{title}, {yoe:.1f}y exp at {company_str} — {ml_ctx}.{skills_str}{disq_note}{ghost_note}"
+        s1 = f"{title}, {yoe:.1f}y exp at {company_str} — {ml_ctx}.{skills_str}{disq_note}{ghost_note}{junior_note}{reach_note}"
 
         logistics = []
         if is_primary_city:
             logistics.append(f"based in {location} (office city)")
         else:
             logistics.append(loc_ctx)
-        if notice_days <= 30:
-            logistics.append(notice_str)
-        else:
-            logistics.append(notice_str)
+        logistics.append(notice_str)
         if traj_str:
             logistics.append(traj_str)
         s2 = ", ".join(logistics).capitalize() + "."
@@ -136,7 +140,6 @@ def generate_reasoning(row: dict) -> str:
 
     # ── MID RANGE (11–50): lead with dominant signal, flag the main friction ──
     if rank <= 50:
-        # Determine what the main positive is
         if has_disqualifying_lang:
             s1 = f"{title} ({yoe:.1f}y, {company_str}) — narrative states deployment was handled by another team.{skills_str}"
             flags = []
@@ -146,7 +149,14 @@ def generate_reasoning(row: dict) -> str:
                 flags.append(f"abroad ({loc_ctx})")
             elif not is_primary_city and not willing_relocate:
                 flags.append(f"{loc_ctx}")
+            if is_junior_stagnant:
+                flags.append("junior title with no promotion")
+            if low_response:
+                flags.append(low_response_str)
             s2 = ("Flags: " + ", ".join(flags) + ".") if flags else f"{loc_ctx}, {notice_str}."
+        elif is_junior_stagnant:
+            s1 = f"{title}, {yoe:.1f}y — junior-level title throughout career with no detected promotion.{skills_str}"
+            s2 = f"Mismatch for a founding-team role requiring senior judgment. {loc_ctx}, {notice_str}."
         elif has_ml and yrs_since_ml <= 1:
             s1 = f"{title}, {yoe:.1f}y — active production ML at {company_str}.{skills_str}"
             frictions = []
@@ -158,6 +168,8 @@ def generate_reasoning(row: dict) -> str:
                 frictions.append(loc_ctx)
             if n_it >= 1:
                 frictions.append(f"{n_it} IT-services role(s)")
+            if low_response:
+                frictions.append(low_response_str)
             s2 = (", ".join(frictions) + ".").capitalize() if frictions else f"{loc_ctx}, {notice_str}."
         elif has_ml and yrs_since_ml <= 3:
             s1 = f"{title}, {yoe:.1f}y — last ML role {yrs_since_ml:.1f}y ago at {company_str}, recency gap is a concern.{skills_str}"
@@ -179,12 +191,25 @@ def generate_reasoning(row: dict) -> str:
             flags.append(f"{loc_ctx}")
         if n_ghost >= 3:
             flags.append(f"{n_ghost} ghost skills")
+        if is_junior_stagnant:
+            flags.append("junior title, no promotion")
+        if low_response:
+            flags.append(low_response_str)
         s2 = ("Additional flags: " + ", ".join(flags) + ".") if flags else f"{loc_ctx}, {notice_str}."
+    elif is_junior_stagnant:
+        s1 = f"{title}, {yoe:.1f}y — junior title throughout career, no upward movement detected.{skills_str}"
+        s2 = f"Significant seniority mismatch for founding-team role. {loc_ctx}, {notice_str}."
     elif has_ml:
         s1 = f"{title}, {yoe:.1f}y at {company_str} — ML background, {yrs_since_ml:.1f}y since last active ML role.{skills_str}"
-        s2 = f"{loc_ctx}, {notice_str}."
+        extras = []
+        if low_response:
+            extras.append(low_response_str)
+        s2 = f"{loc_ctx}, {notice_str}" + (", " + ", ".join(extras) if extras else "") + "."
     else:
         s1 = f"{title}, {yoe:.1f}y at {company_str} — no production ML detected in career narrative.{skills_str}"
-        s2 = f"{loc_ctx}, {notice_str}."
+        extras = []
+        if low_response:
+            extras.append(low_response_str)
+        s2 = f"{loc_ctx}, {notice_str}" + (", " + ", ".join(extras) if extras else "") + "."
 
     return f"{s1} {s2}"
