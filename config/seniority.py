@@ -1,18 +1,3 @@
-"""
-config/seniority.py — Title seniority constants and lookup.
-
-Used by: scoring.py, pipeline/feature_extraction.py
-Single source of truth — previously duplicated between scoring.py and
-04_eval.py where the local copy silently dropped SENIORITY_MID.
-
-Levels:
-  5: principal / staff / head / vp / director
-  4: senior / lead / tech lead
-  3: default (no keyword matched)
-  2: mid-level (engineer II, SDE II)
-  1: junior / associate / intern
-"""
-
 SENIORITY_HIGH = {
     "principal", "staff engineer", "head of", "vp", "vice president",
     "director", "distinguished", "fellow", "chief",
