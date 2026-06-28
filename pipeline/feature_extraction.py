@@ -271,6 +271,17 @@ def extract_features(c: dict, detect_honeypot: bool = True) -> dict:
     trajectory_score = 0.4 * tenure_stability + upward_term + 0.3 * ml_recency_score
     trajectory_score = max(0.0, min(1.0, trajectory_score))
 
+    # Junior-title stagnation — JD seeks someone who's "hit senior engineer
+    # judgment." Someone who has spent the bulk of their career (>=36 months)
+    # at a junior seniority level (title_now == 1) with no upward movement is
+    # a meaningful mismatch against the "founding team / senior judgment" bar.
+    # Only fires when the current title is junior AND they haven't moved up.
+    is_junior_stagnant = (
+        title_now == 1                   # currently titled junior
+        and not trajectory_upward        # no upward movement detected
+        and sum(durations) >= 36         # at least 3 years total tenure
+    )
+
     # ── Availability signals ──────────────────────────────────────────────────
     open_to_work_flag        = bool(sig.get("open_to_work_flag", False))
     recruiter_response_rate  = float(sig.get("recruiter_response_rate", 0.0) or 0.0)
@@ -382,6 +393,7 @@ def extract_features(c: dict, detect_honeypot: bool = True) -> dict:
         "avg_tenure_months":            avg_tenure_months,
         "trajectory_upward":            trajectory_upward,
         "trajectory_score":             trajectory_score,
+        "is_junior_stagnant":           is_junior_stagnant,
         # Salary
         "salary_min_lpa":               salary_min_lpa,
         "salary_max_lpa":               salary_max_lpa,
